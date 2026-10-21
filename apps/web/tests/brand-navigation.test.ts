@@ -25,6 +25,9 @@ for (const path of ["/", "/more", "/about"]) {
     const response = await fetch(web.origin + path);
     assert.equal(response.status, 200, web.logs());
     const $ = cheerio.load(await response.text());
+    for (const file of ["favicon.ico", "icon.png", "favicon.svg", "apple-icon.png", "manifest.webmanifest"]) {
+      assert.equal($(`head link[href='/${file}?v=${SITE.iconVersion}']`).length, 1, `${file} must bypass the previous icon cache`);
+    }
     assert.equal($("aside a").filter((_, el) => $(el).text().includes("返回官网")).attr("href"), SITE.officialUrl);
     assert.equal($("a").filter((_, el) => $(el).text().includes("GitHub 开源")).length, 0);
     assert.equal($("a[href='https://github.com/fxjzai/rl-radar']").length, 0);

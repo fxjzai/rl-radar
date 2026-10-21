@@ -52,6 +52,8 @@ export const SITE = {
   officialUrl: "https://fxjzai.com/",
   /** 标准图标（favicon.ico、icon.png、icon-192.png、apple-icon.png、logo.svg）以外也放在网站根目录的图标，site/brand/ 里的文件名（选填）；manifest.webmanifest 或外站引用了它们时用。 */
   rootIcons: ["favicon.svg"] as string[],
+  /** 替换品牌图标时更新，用于刷新浏览器和已安装应用的图标缓存。 */
+  iconVersion: "20261021",
   /**
    * MCP 工具名的前缀（小写字母、数字、下划线），工具会叫 myhot_get_latest、myhot_search……
    * 已经有人接入后就不要再改。
