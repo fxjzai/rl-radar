@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import type { Route } from "./+types/models";
 import type { AdminModels } from "@aihot/contracts/admin";
-import { SITE } from "@aihot/site";
+import { ADMIN, SITE } from "@aihot/site";
 import { adminGet } from "../../lib/admin.server";
 import { useAdminAction } from "../../features/admin/action";
 import { bj, money, num } from "../../features/admin/format";
@@ -40,6 +40,7 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
       subtitle="每项能力当前用哪个模型、来自哪里（后台切换 > 环境变量 > 代码默认），以及近期的成功率、耗时与费用。切换只影响之后的新任务，已有结果不重算；换精选模型前先看 SelectBench 同批对比。"
       actions={<FilterChips param="days" options={[{ value: "1", label: "24 小时" }, { value: "", label: "7 天" }, { value: "30", label: "30 天" }]} />}
     >
+      {ADMIN.modelCostNote && <p className="mb-5 text-[13px] leading-6 text-ink-3">{ADMIN.modelCostNote}</p>}
       <div className="grid grid-cols-1 gap-5">
         {m.capabilities.map((c) => {
           const total = c.usage.reduce((a, u) => a + u.calls, 0);

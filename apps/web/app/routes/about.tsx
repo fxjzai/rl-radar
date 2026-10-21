@@ -120,7 +120,9 @@ function MakerFace({ src }: { src: string }) {
 function QrCard({ src, kind, title, note }: { src: string; kind: string; title: string; note: string }) {
   return (
     <figure className="card flex items-center gap-5 p-5">
-      <img src={src} alt={`${kind}二维码`} width={112} height={112} loading="lazy" className="size-[104px] shrink-0 rounded-tile border border-line bg-white object-contain p-1.5 sm:size-[112px]" />
+      <a href={src} target="_blank" rel="noopener noreferrer" aria-label={`查看${title}原图`} className="shrink-0 rounded-tile focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent">
+        <img src={src} alt={`${kind}二维码`} width={112} height={112} loading="lazy" className="size-[104px] rounded-tile border border-line bg-white object-contain p-1.5 sm:size-[112px]" />
+      </a>
       <figcaption className="min-w-0">
         <div className="text-[12px] text-ink-4">{kind}</div>
         <div className="mt-1 text-[16px] font-semibold leading-snug text-ink">{title}</div>

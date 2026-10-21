@@ -97,5 +97,54 @@ journalctl -u rlradar-worker-window -f
 
 ## 备份
 
-`DB_BACKUP_*` 指向 S3 兼容对象存储（腾讯云 COS / AWS S3 / 阿里云 OSS）即可让
-`ops.backup`（每天 04:10）自动备份数据库。**磁盘只有 30 GB，建议尽快配上。**
+当前已建立 OSS 桶和生命周期规则；RAM 创建被阿里云账户安全验证拦住，暂未接通自动上传，
+尚未执行 OSS 下载恢复验证，也尚未设置云端 5 元预算提醒。账户验证完成后继续以下接入。
+
+`ops.backup` 每天北京时间 04:10 备份数据库和上传附件；本机只保留每类最近 3 份。
+使用阿里云 OSS 的 S3 兼容接口，生产 `.env` 中配置：
+
+```dotenv
+DB_BACKUP_STORE_BUCKET=fxjzai-ic-backups
+DB_BACKUP_STORE_REGION=cn-shenzhen
+DB_BACKUP_STORE_DOMAIN=fxjzai-ic-backups.oss-cn-shenzhen.aliyuncs.com
+# DB_BACKUP_STORE_SECRET_ID 和 DB_BACKUP_STORE_SECRET_KEY 只填在服务器受保护配置中
+```
+
+桶使用深圳标准本地冗余、私有访问、阻止公共访问、SSE-OSS 加密。生命周期规则分别为
+`daily/` 30 天、`weekly/` 56 天、`monthly/` 366 天；每周日额外写 weekly，每月 1 日额外写 monthly。
+`ic-backup` RAM 用户仅允许在这些目录 PutObject / GetObject，以及限定前缀的 ListObjects，
+不开控制台登录、不授权 DeleteObject。过期对象由 OSS 生命周期自动删除。
+
+按 2026-10-21 的 6.6 MB 压缩数据库备份测算，约 50 份占 0.33 GB，
+以标准本地冗余 0.12 元/GB/月估计约 0.04 元/月；若每份增长到 100 MB，约 0.60 元/月。
+另计请求费、附件和恢复下载流量。授权预算为每月 5 元，预算提醒不等于硬性停费。
+以阿里云实际账单为准：[OSS 计费](https://help.aliyun.com/zh/oss/understanding-billing/)。
+
+备份成功需同时核对 `settings` 的 `backup.last` 中 `uploaded=true`、OSS 对象大小和 SHA-256，
+并把下载的 dump 恢复到独立临时数据库验证；恢复时不要覆盖生产库。新凭证或端点变更后必须重做上传与恢复验证。
+
+## 模型、费用与异常通知
+
+- 默认模型使用官方 `deepseek-flash`，`LLM_VISION=true`；命名预设也声明支持图片。
+  真实图片输入已用合成红蓝色块验证，未把访客图片用于接入测试。
+- 嵌入模型使用 MCKJ `bge-m3`：`EMBEDDING_BASE_URL=https://aiapi.szmckj.cn/v1`、
+  `EMBEDDING_MODEL=bge-m3`、`EMBEDDING_DIMS=0`。不发送供应商可能不支持的 dimensions 参数，
+  实测返回 1024 维。专用 Key 只允许 bge-m3 和源站 IP，保存在服务器 `.env`（600）。
+- 费用统计是回执 token 用量乘单价的估算，包含缓存命中折扣，不是充值余额或供应商账单。
+  `deploy/apply-prices.ts` 为本站闲时 worker 配置 DeepSeek Flash 的人民币单价，先 dry-run，确认后执行：
+
+  ```bash
+  docker exec -i rlradar-api-1 node --input-type=module - < deploy/apply-prices.ts
+  docker exec -i rlradar-api-1 node --input-type=module - --apply < deploy/apply-prices.ts
+  ```
+
+  2026-10-21 核对的每百万 token 单价为输入 1 元、缓存命中 0.02 元、输出 4 元。
+  只适用于本站 00:30–08:30 的调用口径；将来开放高峰运行需先更新价格口径。
+  [官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。
+  MCKJ 目前公示 BGE-M3 输入/输出为 0；这不包含自部署机器成本。
+- 异常通知使用 `FEISHU_INTERNAL_ENABLED=true` 和 `FEISHU_ALERT_WEBHOOK_URL`，
+  消息以站名“反向加载”开头满足机器人关键词校验。Webhook 只用于运维告警；不要提交真实地址。
+  机器人拒收、HTTP 或网络错误不能记为发送成功。现有告警检查随 worker 每 10 分钟运行，
+  当前白天 worker 停止时也不执行检查；这不是全天独立可用性监控。
+- 关于页使用 `site/brand/contact/qr-wechat-personal.jpg`，也可在后台设置中替换。
+  用户提供的两张图实际是同一个个人微信链接，因此只展示添加微信入口；点击可查看原图扫码。

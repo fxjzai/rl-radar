@@ -33,10 +33,10 @@ export const PRESETS: Record<string, ModelPreset> = {
   // with room in the output for the reasoning.
   "deepseek-flash": {
     service: "deepseek", model: "deepseek-flash", baseUrlEnv: "DEEPSEEK_BASE_URL", apiKeyEnv: "DEEPSEEK_API_KEY",
-    extra: { thinking: { type: "disabled" } }, jsonMode: true,
+    extra: { thinking: { type: "disabled" } }, jsonMode: true, vision: true,
   },
   "deepseek-flash-think": {
-    service: "deepseek", model: "deepseek-flash", baseUrlEnv: "DEEPSEEK_BASE_URL", apiKeyEnv: "DEEPSEEK_API_KEY", reasoningTokens: 4000, jsonMode: true,
+    service: "deepseek", model: "deepseek-flash", baseUrlEnv: "DEEPSEEK_BASE_URL", apiKeyEnv: "DEEPSEEK_API_KEY", reasoningTokens: 4000, jsonMode: true, vision: true,
   },
   "qwen3.7-flash": {
     service: "dashscope", model: "qwen3.7-flash", baseUrlEnv: "DASHSCOPE_BASE_URL", apiKeyEnv: "DASHSCOPE_API_KEY",

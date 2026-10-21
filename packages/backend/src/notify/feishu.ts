@@ -5,6 +5,7 @@
 import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { beijingDate, beijingTime } from "@aihot/contracts/time";
+import { SITE } from "@aihot/site";
 import { config, credential } from "../config.ts";
 import { sql } from "../db.ts";
 
@@ -119,13 +120,39 @@ export function formatRecovery(title: string, since: Date, now: number): { title
   return { title: `✅ 已恢复：${title}`, lines: [`持续 ${duration(now - since.getTime())}（${beijingStamp(since)} 起）`] };
 }
 
-/** Operations alert: the alert chat, falling back to the internal feedback chat — never a content group. */
+/** Operations alerts use their own custom bot when configured, otherwise the application's internal chat. */
 export async function sendAlert(title: string, lines: string[]): Promise<"sent" | "disabled"> {
   // Production needs no label; any other environment that has sending on says which one it is.
   const text = `${config.environmentName === "production" ? "" : `【${config.environmentName}】`}${title}\n${lines.join("\n")}`;
   if (!feishuInternalEnabled()) {
     console.log(JSON.stringify({ level: "warn", msg: "alert (not sent: FEISHU_INTERNAL_ENABLED is off)", title, lines }));
     return "disabled";
+  }
+  const webhook = credential("integrations", "FEISHU_ALERT_WEBHOOK_URL");
+  if (webhook) {
+    let url: URL | null = null;
+    try { url = new URL(webhook); } catch { /* Do not include a malformed secret URL in errors. */ }
+    if (!url || url.origin !== "https://open.feishu.cn" || !url.pathname.startsWith("/open-apis/bot/v2/hook/") || url.username || url.password) {
+      throw new Error("FEISHU_ALERT_WEBHOOK_URL must be a Feishu custom-bot webhook");
+    }
+    let res: Response;
+    try {
+      res = await fetch(webhook, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ msg_type: "text", content: { text: `【${SITE.name}】${text}` } }),
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      // A transport error can contain the secret webhook URL. Keep it out of job logs.
+      throw new Error("Feishu alert webhook request failed");
+    }
+    const json = await res.json().catch(() => null) as { code?: unknown; StatusCode?: unknown } | null;
+    const code = json?.code ?? json?.StatusCode;
+    if (!res.ok || typeof code !== "number" || code !== 0) {
+      throw new Error(`Feishu alert webhook not acknowledged (HTTP ${res.status}, code ${typeof code === "number" ? code : "missing"})`);
+    }
+    return "sent";
   }
   const chat = credential("integrations", "FEISHU_ALERT_CHAT_ID") ?? credential("integrations", "FEISHU_INTERNAL_CHAT_ID");
   if (!chat) return "disabled";

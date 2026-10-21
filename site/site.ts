@@ -161,7 +161,11 @@ export const ABOUT = {
    * avatarSourceId：一个 X 账号信源的 id，头像取它的（选填）。
    * 二维码在后台“设置”里上传，或者放进 site/brand/contact/；没有二维码就不显示那张卡片。
    */
-  maker: null as null | {
+  maker: {
+    name: "Ray",
+    greeting: ["我在这里整理值得关注的科技动态，欢迎交流想法，也欢迎推荐有价值的信源。"],
+    wechat: { kind: "微信", title: "添加我的微信", note: "扫码添加好友，交流科技、AI 与工具使用；需要入群也可以联系我。" },
+  } as null | {
     name: string;
     avatarSourceId?: string | null;
     greeting: string[];
@@ -182,6 +186,7 @@ export const ADMIN = {
   banNote: null as string | null,
   /** 确认框里补的一句本站规定：调整付费服务的请求上限时。 */
   budgetNote: null as string | null,
+  modelCostNote: "费用为 token 用量乘以配置单价的估算，不是服务商账单。当前 DeepSeek Flash 按闲时单价计算：每百万 token 输入 1 元、缓存命中 0.02 元、输出 4 元（核对日期 2026-10-21）。本站 worker 仅在 00:30–08:30 运行；若以后开启高峰时段调用，需同步更新费用口径。" as string | null,
 };
 
 /** Agent 接入页的示例。 */

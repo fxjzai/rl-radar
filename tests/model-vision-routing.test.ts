@@ -20,7 +20,8 @@ test("every step takes a model that reads images; only a step that needs images 
   assert.equal(capabilityAcceptsModel(understand, MODELS["qwen3-vl-flash"]!), true);
   assert.equal(capabilityAcceptsModel(understand, MODELS["deepseek-flash"]!), true);
   assert.equal(capabilityAcceptsModel(CAPABILITIES.score, MODELS["qwen3-vl-flash"]!), true);
-  assert.equal(capabilityAcceptsModel({ ...understand, vision: true }, MODELS["deepseek-flash"]!), false);
+  assert.equal(capabilityAcceptsModel({ ...understand, vision: true }, MODELS["deepseek-flash"]!), true);
+  assert.equal(capabilityAcceptsModel({ ...understand, vision: true }, MODELS["qwen3.8-flash"]!), false);
 
   await switchModel("understand", "qwen3-vl-flash", "vision routing test", "test");
   assert.equal(await modelFor("understand"), "qwen3-vl-flash");
@@ -34,6 +35,8 @@ test("every step takes a model that reads images; only a step that needs images 
 test("runtime image attachment is explicit rather than probing presets with unspecified vision support", () => {
   assert.equal(modelSupportsVision("qwen3-vl-flash"), true);
   assert.equal(modelSupportsVision("glm-5.3-flash"), true);
+  assert.equal(modelSupportsVision("deepseek-flash"), true);
+  assert.equal(modelSupportsVision("deepseek-flash-think"), true);
   assert.equal(modelSupportsVision("qwen3.8-flash"), false);
   assert.equal(modelSupportsVision("default"), process.env.LLM_VISION === "true");
 });
