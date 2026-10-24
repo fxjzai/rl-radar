@@ -125,31 +125,43 @@ DNS 和客户端连接缓存需要时间更新。回退后核对响应链路、�
 
 ## 备份
 
-当前已建立 OSS 桶和生命周期规则；RAM 创建被阿里云账户安全验证拦住，暂未接通自动上传，
-尚未执行 OSS 下载恢复验证，也尚未设置云端 5 元预算提醒。账户验证完成后继续以下接入。
+自动备份已接通 OSS。`cron.ops.backup` 按 `Asia/Shanghai` 的 `10 4 * * *` 执行，
+由夜间 worker 运行；白天 worker 停止不影响这个时间点。实际任务与最近结果应查生产
+pg-boss schedule 和 `settings` 的 `backup.last`，详细核验台账保存在内部运维文档。
 
-`ops.backup` 每天北京时间 04:10 备份数据库和上传附件；本机只保留每类最近 3 份。
-使用阿里云 OSS 的 S3 兼容接口，生产 `.env` 中配置：
+### 配置与保留
+
+使用阿里云 OSS 的 S3 兼容接口。以下均为占位符，按实际桶和地域替换；
+`DB_BACKUP_STORE_DOMAIN` 填含桶名的域名，不带协议或路径：
 
 ```dotenv
-DB_BACKUP_STORE_BUCKET=fxjzai-ic-backups
-DB_BACKUP_STORE_REGION=cn-shenzhen
-DB_BACKUP_STORE_DOMAIN=fxjzai-ic-backups.oss-cn-shenzhen.aliyuncs.com
+DB_BACKUP_STORE_BUCKET=<bucket>
+DB_BACKUP_STORE_REGION=<region>
+DB_BACKUP_STORE_DOMAIN=<bucket>.s3.oss-<region>.aliyuncs.com
 # DB_BACKUP_STORE_SECRET_ID 和 DB_BACKUP_STORE_SECRET_KEY 只填在服务器受保护配置中
 ```
 
-桶使用深圳标准本地冗余、私有访问、阻止公共访问、SSE-OSS 加密。生命周期规则分别为
-`daily/` 30 天、`weekly/` 56 天、`monthly/` 366 天；每周日额外写 weekly，每月 1 日额外写 monthly。
-`ic-backup` RAM 用户仅允许在这些目录 PutObject / GetObject，以及限定前缀的 ListObjects，
-不开控制台登录、不授权 DeleteObject。过期对象由 OSS 生命周期自动删除。
+凭证保存在权限为 `600` 的生产 `.env`；不要提交真实凭证、备份文件或配置副本。
+桶使用私有访问、阻止公共访问和服务端加密。专用 RAM 身份只授予 `daily/`、`weekly/`、
+`monthly/` 前缀内的 PutObject / GetObject 及限定前缀的 ListObjects；不授予 DeleteObject 或控制台登录。
+过期对象由桶生命周期清理：`daily/` 30 天、`weekly/` 56 天、`monthly/` 366 天。
+应用不会替代管理员创建或核验这些云端规则，变更后应在 OSS 后台复核。
 
-按 2026-10-21 的 6.6 MB 压缩数据库备份测算，约 50 份占 0.33 GB，
-以标准本地冗余 0.12 元/GB/月估计约 0.04 元/月；若每份增长到 100 MB，约 0.60 元/月。
-另计请求费、附件和恢复下载流量。授权预算为每月 5 元，预算提醒不等于硬性停费。
-以阿里云实际账单为准：[OSS 计费](https://help.aliyun.com/zh/oss/understanding-billing/)。
+每次生成同一时间戳的一对数据库 custom-format `.dump` 和附件 `.tar.gz`，文件名使用 UTC。
+附件范围为 `uploads/` 和仍需本地保存的 `feedback-screenshots/`；已转发到飞书的图片只保留数据库引用，
+图片缓存不入包。本机每类只留最新 3 份；周日额外写 `weekly/`，每月 1 日额外写 `monthly/`。
+数据库、附件备份不包含生产 `.env`、镜像或 DNS/CDN 配置，这些恢复资产需另行受保护保存。
 
-备份成功需同时核对 `settings` 的 `backup.last` 中 `uploaded=true`、OSS 对象大小和 SHA-256，
-并把下载的 dump 恢复到独立临时数据库验证；恢复时不要覆盖生产库。新凭证或端点变更后必须重做上传与恢复验证。
+### 核验与恢复
+
+1. 核对计划存在、worker 在执行窗口运行，以及 `backup.last` 时间、`uploaded=true` 和配对对象清单。
+2. 从 OSS 下载这对对象，与任务记录逐一比较大小和 SHA-256；执行 `pg_restore --list` 和 `tar -tzf` 检查可读性。
+3. 将 dump 恢复到独立临时数据库，在隔离的数据目录恢复附件；核对核心表计数、附件引用和二维码文件，
+   再做业务验收。不要直接覆盖生产库。
+4. 新凭证或端点变更后重做上传、下载校验与隔离恢复。`uploaded=true` 或归档可列出均不能替代完整恢复演练。
+
+费用按实际存储、请求和恢复下载流量计量；预算提醒不等于硬性停费。
+实际资源标识、权限核验、恢复演练记录与费用台账只维护在内部运维文档，不写入公开仓库。
 
 ## 模型、费用与异常通知
 
