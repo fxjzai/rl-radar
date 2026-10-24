@@ -55,7 +55,7 @@ systemctl enable --now rlradar-worker-window.timer
 - `ADMIN_PASSWORD` / `SESSION_SECRET` / `IMG_PROXY_SIGN_SECRET` / `POSTGRES_PASSWORD`：用 `node scripts/init-env.ts` 生成
 - `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`：DeepSeek
 - `COLLECT_ENABLED=true`、`MODEL_CALLS_ENABLED=true` —— **配合闲时窗口使用**，别让 worker 在工作时段常驻
-- `PORT=127.0.0.1:3000`、`SITE_DOMAIN=ic.fxjzai.com`、`TRUST_PROXY=true`（前面有 Cloudflare/Caddy）
+- `PORT=127.0.0.1:3000`、`SITE_DOMAIN=ic.fxjzai.com`、`TRUST_PROXY=true`（前面有 Dooki CDN/Caddy）
 - **不要设 `EGRESS_PROXY_URL`**：服务器在洛杉矶，海外信源直连即可。那边是国内 fake-IP 代理环境才需要
 
 ## 更新流程
@@ -86,14 +86,42 @@ journalctl -u rlradar-worker-window -f
 
 改完记得 `systemctl restart rlradar-worker-window.timer` 不需要，但脚本改了要重新 `install` 或直接改 `/opt/rl-radar/deploy/` 下的文件。
 
-## Cloudflare / CDN
+## Dooki CDN 与 Cloudflare DNS
 
-域名已经走 Cloudflare 代理（橙云）。要点：
+`ic.fxjzai.com` 使用 Dooki CDN，Cloudflare 只管理这条域名的 DNS；不要再为此记录开启橙云，避免两层 CDN 叠加。官网 `fxjzai.com` 仍使用 Workers，不受本配置影响。
 
-1. 边缘 SSL/TLS 模式用 **Full (strict)**；源站 Caddy 用 Let's Encrypt 证书（HTTP-01 挑战能穿过 Cloudflare 到达源站）。
-2. 因为 `TRUST_PROXY=true`，应用从 `X-Forwarded-For` / `CF-Connecting-IP` 读访客地址；**故意伪造该头会被用来绕过登录与反馈限流，所以只在确认有反代时才开**。
-3. 进阶加固：把 ufw 的 80/443 从 `Anywhere` 收紧到 **Cloudflare 官方 IP 段**，这样别人无法绕过 CDN 直连源站 IP。加入 CDN 后再做。
-4. MCP 默认只接受 `SITE_URL` 主机；有额外访问域名时写 `MCP_ALLOWED_HOSTS`。
+- Dooki 站点 ID：`4396`，使用现有 Ray-tutu 套餐。
+- Cloudflare 记录：`ic` CNAME → `663d4327.dnm.ink`，DNS only，TTL 300 秒。
+- CDN 源站：`https://154.12.55.219:443`，Host 跟随访问域名 `ic.fxjzai.com`；不使用公网 IC 域名作为回源地址，以免 DNS 切换后形成循环。
+- CDN 已绑定匹配域名的免费 ACME 证书并开启自动续期；源站保留 Caddy 的 HTTPS。接入时用于提前申请边缘证书的临时 ACME 转发已移除。
+- 源站 Caddy 不启用 `encode`，向 CDN 返回未压缩正文；Dooki 站点启用内容压缩。不要在回源请求头中强制 `Accept-Encoding`，也不要手工覆盖响应的 `Content-Length` / `Content-Encoding`。
+- HTTP 自动 301 跳转 HTTPS，保留路径与参数；启用 HTTP/2 与 HTTP/3，最低 TLS 1.2。
+- 仅缓存 `/assets/` 的 GET 响应，边缘缓存 1 天，缓存 key 保留协议、主机、路径和查询参数。只缓存 200，遇 `private`、`no-cache`、`no-store` 或 `Set-Cookie` 跳过；不延长浏览器缓存。
+- 其余路径默认不在 CDN 缓存，包括 HTML、导航 `.data`、`/api/`、RSS、后台与登录、MCP POST；遵循应用原本的缓存期限，不叠加动态缓存。后台响应应为 `private, no-store`，未认证管理接口应为 401。
+- 发布后验证静态 CSS/JS 的 `X-Cache: HIT`，以及动态接口和后台的 `X-Cache: BYPASS`；用 `node scripts/smoke.ts --base https://ic.fxjzai.com` 检查页面、机器接口和 MCP 握手。
+
+源站目前仍允许公开 80/443。后续如限制入站，应使用 Dooki 官方节点范围，保留证书验证路径；不能继续照旧只允许 Cloudflare IP。`TRUST_PROXY` 仅用于受控反代链，访客地址与限流应在变更代理链后核对。
+
+图标使用原始品牌文件。固定图标 URL 的源站缓存期为 30 天：发布后如仍见旧图标，要同时核对 CDN 与浏览器缓存；清除 CDN 缓存不会清除读者浏览器已经保存的旧图标。
+
+### 响应完整性与压缩边界
+
+IC 实际部署曾复现：源站 gzip 正常，但 CDN 向不接受压缩的客户端解压后仍使用压缩长度，导致 API 超时、HTTP/2 framing error，静态 JS 也可能缓存成空正文。源站不压缩、边缘负责内容协商可避开这条错误路径；修改后还必须刷新 `https://ic.fxjzai.com/assets/` 的既有缓存。
+
+验收不能只看 200 或 `X-Cache: HIT`。分别以 HTTP/1.1、HTTP/2 和无 `Accept-Encoding`、`identity`、`gzip`、`br` 请求 `/api/v1/agent`、`/api/v1/items?limit=1` 及一份实际静态 JS：完整读取正文，比较解码后的字节数与源站 SHA-256，并确认 JSON 可解析。动态接口仍应 BYPASS，后台仍应拒绝匿名请求；边缘压缩开关启用不代表每次响应一定压缩，以实际响应头为准。最后运行站点 smoke 并在浏览器检查交互和控制台。
+
+Caddyfile 修改先在容器内执行 `caddy validate`，通过后再 `caddy reload`，保留修改前的配置。回退压缩设置前也要验证上述矩阵；仅恢复 `encode zstd gzip` 会重新引入当前 CDN 兼容问题。
+
+### 回退
+
+回退只恢复 IC 的 DNS 记录，不改官网或其他域名。当前记录 ID 为 `c433657f8540b19de99dc67db22599f7`。先用 `cf dns records list --zone fxjzai.com --name ic.fxjzai.com` 核对，再恢复为原源站 A 记录并开启 Cloudflare 代理：
+
+```bash
+cf dns records edit c433657f8540b19de99dc67db22599f7 --zone fxjzai.com \
+  --body '{"type":"A","name":"ic.fxjzai.com","content":"154.12.55.219","ttl":1,"proxied":true}'
+```
+
+DNS 和客户端连接缓存需要时间更新。回退后核对响应链路、图标、静态资源、后台以及 MCP；不要凭控制台保存成功判断接管或回退完成。
 
 ## 备份
 
