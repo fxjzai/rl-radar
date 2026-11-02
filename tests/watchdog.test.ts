@@ -16,7 +16,10 @@ const provider = await stub(async (_hit, req) => {
   if (req.url.endsWith("/auth/v3/tenant_access_token/internal")) return { code: 0, tenant_access_token: "fictional-token", expire: 7200 };
   const body = JSON.parse(req.body);
   assert.equal(body.receive_id, `oc_test_${T}`);
-  attempts.push(JSON.parse(body.content).text as string);
+  assert.equal(body.msg_type, "interactive");
+  const card = JSON.parse(body.content);
+  assert.equal(card.schema, "2.0");
+  attempts.push(card.header.title.content as string);
   return failing ? { code: 99, msg: "synthetic send failure" } : { code: 0, data: { message_id: `message-${T}` } };
 });
 const realFetch = globalThis.fetch;

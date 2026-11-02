@@ -183,7 +183,12 @@ DB_BACKUP_STORE_DOMAIN=<bucket>.s3.oss-<region>.aliyuncs.com
   [官方价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。
   MCKJ 目前公示 BGE-M3 输入/输出为 0；这不包含自部署机器成本。
 - 异常通知使用 `FEISHU_INTERNAL_ENABLED=true` 和 `FEISHU_ALERT_WEBHOOK_URL`，
-  消息以站名“反向加载”开头满足机器人关键词校验。Webhook 只用于运维告警；不要提交真实地址。
+  消息统一使用飞书原生卡片（JSON 2.0）：标题以站名“反向加载”开头满足机器人关键词校验，
+  红色表示需立即处理、橙色表示今日跟进、绿色表示已恢复，日报和周报使用蓝色。
+  正文分区突出影响范围、恢复方式和处理建议，底部显示北京时间和管理后台按钮；
+  聊天列表预览包含状态与标题。过长的周报保留前部内容并提示到后台查看，避免超过机器人 20 KB 限制。
+  自定义 Webhook 和应用内部群使用同一份卡片，不需要新增权限或数据库迁移。
+  Webhook 只用于运维通知；不要提交真实地址。
   机器人拒收、HTTP 或网络错误不能记为发送成功。现有告警检查随 worker 每 10 分钟运行，
   当前白天 worker 停止时也不执行检查；这不是全天独立可用性监控。
 - 关于页使用 `site/brand/contact/qr-wechat-personal.jpg`，也可在后台设置中替换。

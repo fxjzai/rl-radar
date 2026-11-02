@@ -120,14 +120,70 @@ export function formatRecovery(title: string, since: Date, now: number): { title
   return { title: `✅ 已恢复：${title}`, lines: [`持续 ${duration(now - since.getTime())}（${beijingStamp(since)} 起）`] };
 }
 
+/** Both bot transports render the same card; keep untrusted source/error text out of card markup. */
+function alertCard(title: string, lines: string[]) {
+  const escape = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/[\\`*_\[\]~]/g, "\\$&");
+  const status = title.startsWith("🔴") ? { label: "需立即处理", color: "red" }
+    : title.startsWith("🟠") ? { label: "今日跟进", color: "orange" }
+    : title.startsWith("✅") ? { label: "已恢复", color: "green" }
+    : title.startsWith("📋") ? { label: "系统日报", color: "blue" }
+    : title.startsWith("📊") ? { label: "信源周报", color: "blue" }
+    : { label: "运行通知", color: "blue" };
+  const heading = Array.from(title.replace(/^(?:🔴|🟠|✅|📋|📊)\s*/u, "")).slice(0, 200).join("");
+  const site = `【${SITE.name}】${config.environmentName === "production" ? "" : `【${config.environmentName}】`}`;
+  const sections: string[] = [];
+  let bytes = 0;
+  // Custom bots accept at most 20 KB per request. Reserve space for the envelope and footer.
+  for (const line of lines) {
+    const field = /^(影响|会自己好吗|你需要)：([\s\S]*)$/.exec(line);
+    const labels: Record<string, string> = { "影响": "影响范围", "会自己好吗": "恢复方式", "你需要": "处理建议" };
+    const rendered = field ? `**${labels[field[1]]}**\n${escape(field[2])}` : escape(line);
+    const size = Buffer.byteLength(JSON.stringify(rendered));
+    if (bytes + size > 12_000) {
+      let excerpt = "";
+      for (const char of rendered) {
+        const cost = Buffer.byteLength(JSON.stringify(char));
+        if (bytes + cost > 12_000) break;
+        excerpt += char;
+        bytes += cost;
+      }
+      if (excerpt) sections.push(`${excerpt}…`);
+      sections.push("**内容较长，后续详情请到后台查看。**");
+      break;
+    }
+    sections.push(rendered);
+    bytes += size + 4;
+  }
+  return {
+    schema: "2.0",
+    config: { update_multi: true, summary: { content: `${site}${status.label} · ${heading}` } },
+    header: {
+      title: { tag: "plain_text", content: `${site}${heading}` },
+      subtitle: { tag: "plain_text", content: status.label },
+      template: status.color,
+    },
+    body: {
+      elements: [
+        ...(sections.some(Boolean) ? [{ tag: "markdown", content: sections.join("\n\n") }] : []),
+        { tag: "hr" },
+        { tag: "markdown", content: `通知时间：${beijingStamp(Date.now())}（北京时间）`, text_size: "notation" },
+        {
+          tag: "button", text: { tag: "plain_text", content: "打开管理后台" }, type: "primary",
+          behaviors: [{ type: "open_url", default_url: `${config.siteUrl}/admin` }],
+        },
+      ],
+    },
+  };
+}
+
 /** Operations alerts use their own custom bot when configured, otherwise the application's internal chat. */
 export async function sendAlert(title: string, lines: string[]): Promise<"sent" | "disabled"> {
-  // Production needs no label; any other environment that has sending on says which one it is.
-  const text = `${config.environmentName === "production" ? "" : `【${config.environmentName}】`}${title}\n${lines.join("\n")}`;
   if (!feishuInternalEnabled()) {
     console.log(JSON.stringify({ level: "warn", msg: "alert (not sent: FEISHU_INTERNAL_ENABLED is off)", title, lines }));
     return "disabled";
   }
+  const card = alertCard(title, lines);
   const webhook = credential("integrations", "FEISHU_ALERT_WEBHOOK_URL");
   if (webhook) {
     let url: URL | null = null;
@@ -140,7 +196,7 @@ export async function sendAlert(title: string, lines: string[]): Promise<"sent" 
       res = await fetch(webhook, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ msg_type: "text", content: { text: `【${SITE.name}】${text}` } }),
+        body: JSON.stringify({ msg_type: "interactive", card }),
         signal: AbortSignal.timeout(15_000),
       });
     } catch {
@@ -156,7 +212,7 @@ export async function sendAlert(title: string, lines: string[]): Promise<"sent" 
   }
   const chat = credential("integrations", "FEISHU_ALERT_CHAT_ID") ?? credential("integrations", "FEISHU_INTERNAL_CHAT_ID");
   if (!chat) return "disabled";
-  await sendToChat(chat, "text", { text });
+  await sendToChat(chat, "interactive", card);
   return "sent";
 }
 
