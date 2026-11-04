@@ -70,6 +70,11 @@ test("ordinary public headers allow a different-origin redirect", async () => {
   assert.equal(result.url, b.url + "/public");
   assert.equal(b.hits.at(-1)!.method, "GET");
 });
+test("a caller's header replaces the default whatever the case of its name", async () => {
+  await guardedFetch(a.url + "/caller-headers", { headers: { "User-Agent": "fixture-agent/1.0", "ACCEPT-LANGUAGE": "en" } });
+  assert.equal(a.hits.at(-1)!.headers["user-agent"], "fixture-agent/1.0");
+  assert.equal(a.hits.at(-1)!.headers["accept-language"], "en");
+});
 for (const status of [301, 302, 303, 307, 308]) {
   for (const method of ["POST", "PUT", "GET", "HEAD"]) {
     test(`same-origin ${status} preserves expected ${method} semantics`, async () => {
@@ -128,6 +133,9 @@ test("one deadline and response byte limit remain effective", async () => {
   await assert.rejects(guardedFetch(a.url + "/slow", { timeoutMs: 100, maxRedirects: 9 }), { name: "TimeoutError" });
   a.routes.set("/large", (_hit, res) => { res.end("x".repeat(1000)); });
   await assert.rejects(guardedFetch(a.url + "/large", { maxBytes: 100 }), /too large/i);
+  const head = await guardedFetch(a.url + "/large", { maxBytes: 100, truncate: true });
+  assert.deepEqual([head.text(), head.truncated], ["x".repeat(100), true]);
+  assert.equal((await guardedFetch(a.url + "/large", { maxBytes: 1000, truncate: true })).truncated, false);
 });
 test("normal private-network guards still refuse direct and redirect destinations", async () => {
   config.allowPrivateNetworkFetch = false;
@@ -147,7 +155,7 @@ test("normal private-network guards still refuse direct and redirect destination
 test("opaque JSON-source query configuration cannot redirect to another origin", async () => {
   redirect("/json", b.url + "/json?api_key=" + key);
   b.routes.set("/json", (_hit, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end('[{"title":"fixture","url":"https://example.org/item"}]'); });
-  const source: SourceRow = { id: "redirect-fixture", name: "fixture", kind: "json_list", tier: "T1", participation_mode: "editorial", first_party: false, interval_minutes: 60, enabled: true, cursor: null, fail_count: 0, config: { url: `${a.url}/json?api_key=${key}`, titlePaths: ["title"], urlTemplate: "{raw:url}" } };
+  const source: SourceRow = { id: "redirect-fixture", name: "fixture", kind: "json_list", tier: "T1", participation_mode: "editorial", uses: [], first_party: false, interval_minutes: 60, enabled: true, cursor: null, fail_count: 0, config: { url: `${a.url}/json?api_key=${key}`, titlePaths: ["title"], urlTemplate: "{raw:url}" } };
   const count = b.hits.length;
   await assert.rejects(fetchJsonList(source), /redirect/i);
   assert.equal(b.hits.length, count);
@@ -155,6 +163,6 @@ test("opaque JSON-source query configuration cannot redirect to another origin",
 test("opaque JSON query callers retain same-origin redirects", async () => {
   redirect("/json-safe", "/json-final?api_key=" + key);
   a.routes.set("/json-final", (_hit, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end('[{"title":"same-origin","url":"https://example.org/safe"}]'); });
-  const source: SourceRow = { id: "same-origin", name: "fixture", kind: "json_list", tier: "T1", participation_mode: "editorial", first_party: false, interval_minutes: 60, enabled: true, cursor: null, fail_count: 0, config: { url: `${a.url}/json-safe?api_key=${key}`, titlePaths: ["title"], urlTemplate: "{raw:url}" } };
+  const source: SourceRow = { id: "same-origin", name: "fixture", kind: "json_list", tier: "T1", participation_mode: "editorial", uses: [], first_party: false, interval_minutes: 60, enabled: true, cursor: null, fail_count: 0, config: { url: `${a.url}/json-safe?api_key=${key}`, titlePaths: ["title"], urlTemplate: "{raw:url}" } };
   assert.equal((await fetchJsonList(source))[0]!.title, "same-origin");
 });

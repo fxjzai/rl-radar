@@ -1,7 +1,7 @@
 // Public scope and sync through the real api routes: a licence revocation or a withdrawal reaches
 // every exit, reports stop quoting withdrawn items, the hot board drops a withdrawn item at once, item
-// pages follow one rule, a withdrawal next to an unresolved selection leaves new snapshots at once, and
-// snapshots answer conditional requests.
+// pages follow one rule, a withdrawal next to an unresolved selection leaves new snapshots at once,
+// snapshots answer conditional requests, and browsing 全部动态 leaves out low scores that a search still finds.
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -17,6 +17,10 @@ import { stopBoss } from "@aihot/backend/jobs/queue";
 import { publishArticle, republishSource } from "@aihot/backend/publication/publish";
 import { computeHotRanking } from "@aihot/backend/events/hot";
 import { latestHotRanking } from "@aihot/backend/publication/hot";
+import { itemFeed } from "@aihot/backend/publication/feeds";
+import { loadPool } from "@aihot/backend/publication/pool";
+import { v1Items } from "@aihot/backend/publication/v1";
+import { SELECTION } from "@aihot/industry/selection";
 import { loadItemShare } from "@aihot/backend/publication/og";
 import { buildApp } from "../apps/api/src/app.ts";
 
@@ -37,11 +41,12 @@ after(async () => {
 });
 
 let n = 0;
-/** A selected article with full text and a summary. */
+/** A selected article with full text and a summary, found and published a minute ago: a rolling window that ends at the reader's clock holds it. */
 async function article(): Promise<string> {
   n += 1;
+  const minuteAgo = new Date(Date.now() - 60_000);
   const { articleId } = await upsertMaterial({
-    sourceId: SOURCE, url: `https://example.com/${T}-${n}`, title: `Test ${n}`, bodyText: BODY, bodyHtml: `<p>${BODY}</p>`, bodyStatus: "ok", via: "fetch", publishedAt: new Date(),
+    sourceId: SOURCE, url: `https://example.com/${T}-${n}`, title: `Test ${n}`, bodyText: BODY, bodyHtml: `<p>${BODY}</p>`, bodyStatus: "ok", via: "fetch", publishedAt: minuteAgo, discoveredAt: minuteAgo,
   });
   await sql`INSERT INTO analyses (article_id, input_revision, origin, relevance, category, title_zh, summary_zh, reason_zh, score, selected)
             VALUES (${articleId}, 1, 'rule', 'pass', 'ai-models', ${`标题${n}-${T}`}, ${`SUMMARY-${n}-${T}`}, '理由', 90, true)`;
@@ -100,9 +105,10 @@ test("Markdown preserves a table's headings, caption, links, alignment and multi
   await sql`UPDATE articles SET language = 'en', body_html = ${table} WHERE id = ${id}`;
   await sql`INSERT INTO translations (article_id, revision, body_html, body_text, origin) VALUES (${id}, 1, ${table.replace('Benchmark results', '基准结果').replace('Model', '模型').replace('Score', '分数')}, '基准结果', 'source')`;
   await publishArticle(id, released());
-  const response = await get(`/items/${id}/markdown`);
-  assert.equal(response.status, 200);
-  const $ = cheerio.load(marked.parse(response.body, { async: false, gfm: true }));
+  const raw = await app.inject({ method: "GET", url: `/items/${id}/markdown` });
+  assert.equal(raw.statusCode, 200);
+  assert.equal(raw.headers.link, `<${config.siteUrl}/items/${id}>; rel="canonical"`);
+  const $ = cheerio.load(marked.parse(raw.body, { async: false, gfm: true }));
   assert.equal($('table').length, 2, 'both original and translated tables survive export');
   assert.deepEqual($('table th').toArray().map((node) => $(node).text()), ['模型', '分数', 'Model', 'Score']);
   assert.equal($('table th').last().attr('align'), 'right');
@@ -355,7 +361,8 @@ test("unresolved selection does not delay a withdrawal or its sync watermark", a
   // This snapshot already includes the withdrawal; completing y adds only y afterwards.
   const snapshot = JSON.parse((await get("/api/v1/selected/snapshot?fields=minimal&limit=1000")).body) as { cursor: string };
   await sql`UPDATE articles SET grouping_status = 'complete', grouped_at = now() WHERE id = ${y}`;
-  await publishArticle(y);
+  // Completed a minute ago: the changes read at the reader's clock include it even when the VM's clock steps back.
+  await publishArticle(y, { now: new Date(Date.now() - 60_000) });
   const changes = JSON.parse((await get(`/api/v1/selected/changes?cursor=${encodeURIComponent(snapshot.cursor)}&limit=100`)).body) as {
     changes: Array<{ op: string; id?: string; item?: { id: string } }>;
   };
@@ -415,6 +422,17 @@ test("v1 story matches the website's content and fallback ordering", async () =>
     source: { name: r.source.name, firstParty: r.source.firstParty }, publishedAt: r.publishedAt, links: { aihot: `${config.siteUrl}/items/${r.id}` } })));
 });
 
+// An event's public id is kept by search engines and installed clients: once merged, it must lead to the
+// event that took it in, through a relative Location that keeps the reader on the domain they asked.
+test("a merged event's old public id answers 308 to the surviving event", async () => {
+  const current = await storyFor(await article());
+  const merged = randomUUID();
+  await sql`INSERT INTO story_aliases (public_id, story_id) SELECT ${merged}, id FROM stories WHERE public_id = ${current}`;
+  const res = await app.inject({ method: "GET", url: `/api/v1/stories/${merged}` });
+  assert.equal(res.statusCode, 308, "a merged public id is a permanent redirect, not a 404");
+  assert.equal(res.headers.location, `/api/v1/stories/${current}`, "relative Location to the surviving event");
+});
+
 test('event neighbors disappear when their last readable evidence is withdrawn', async () => {
   const id = await article();
   const neighborId = await article();
@@ -443,6 +461,9 @@ test("unchanged republishing preserves freshness, while URL-only changes still r
   assert.deepEqual({ ...await state() }, { ...before }, "no new freshness timestamp or revision for identical content");
   assert.equal((await sql`SELECT max(seq) AS seq FROM selected_ledger WHERE article_id = ${id}`)[0]!.seq, ledger!.seq);
 
+  // Last refreshed a minute ago: the refresh shows even when the VM's clock steps back between the two publications.
+  await sql`UPDATE publications SET updated_at = updated_at - interval '1 minute' WHERE article_id = ${id}`;
+  const aged = await state();
   const url = `https://example.com/${T}-corrected`;
   await sql`UPDATE articles SET url = ${url} WHERE id = ${id}`;
   const result = await publishArticle(id);
@@ -450,7 +471,7 @@ test("unchanged republishing preserves freshness, while URL-only changes still r
   assert.equal(result!.ledger, "upsert", "the public URL change is still recorded for sync clients");
   const changed = await state();
   assert.equal(changed.url, url);
-  assert.ok(changed.updated_at >= before.updated_at);
+  assert.ok(changed.updated_at > aged.updated_at);
   assert.equal(changed.revision, before.revision + 1);
 });
 
@@ -576,4 +597,43 @@ test("a correction between snapshot pages arrives through changes after the fixe
   assert.deepEqual(JSON.parse(changes.body).changes.map((change: { op: string; item: { id: string; title: string } }) =>
     ({ op: change.op, id: change.item.id, title: change.item.title })), [{ op: 'upsert', id, title }],
   'the client applies the correction once after finishing the original snapshot');
+});
+
+// Failure modes: a low-score item still shows on the web list or its page count, v1 (which MCP reads), the
+// Agent list or the all RSS; an unscored item disappears; a search no longer reaches a low-score item.
+test("browsing 全部动态 on every exit leaves out items below the floor, which a search still finds", async () => {
+  const source = `${SOURCE}-floor`;
+  const at = new Date(Date.now() - 3600_000);
+  const floor = SELECTION.browseFloor;
+  const scores: Array<[string, number | null]> = [["low", floor - 1], ["edge", floor], ["unscored", null]];
+  const id = (name: string) => `${T}-floor-${name}`;
+  await sql`INSERT INTO sources (id, name, kind, tier, participation_mode, next_fetch_at) VALUES (${source}, 'Floor fixture', 'rss', 'T2', 'editorial', '2100-01-01')`;
+  for (const [name, score] of scores) {
+    await sql`INSERT INTO articles (id, source_id, identity_key, url, title, discovered_at, timeline_at, published_at)
+      VALUES (${id(name)}, ${source}, ${id(name)}, ${`https://example.org/${id(name)}`}, ${id(name)}, ${at}, ${at}, ${at})`;
+    await sql`INSERT INTO publications (article_id, title, summary, source_id, channel, url, discovered_at, timeline_at, published_at, sort_at,
+        eligible, selected, visibility, tags, score, search_text)
+      VALUES (${id(name)}, ${id(name)}, 'fixture summary', ${source}, 'news', ${`https://example.org/${id(name)}`}, ${at}, ${at}, ${at}, ${at},
+        true, false, 'public', ${[`${T}-floor`]}, ${score}, ${id(name)})`;
+    await sql`INSERT INTO pool_search (article_id, direct, body) VALUES (${id(name)}, ${id(name)}, '')`;
+  }
+  const shown = [id("edge"), id("unscored")];
+  const ours = (ids: string[]) => ids.filter((i) => i.startsWith(`${T}-floor-`)).sort();
+  const now = new Date();
+
+  const pool = await loadPool({ channel: "all", category: null, tag: `${T}-floor`, now });
+  assert.deepEqual(ours(pool.items.map((i) => i.id)), shown, "web list");
+  assert.equal(pool.total, shown.length, "web page count");
+  const v1 = await v1Items({ mode: "all", window: "24h", by: "timeline", category: null, q: null, limit: 100, cursor: null }, now);
+  assert.deepEqual(ours(v1.items.map((i) => i.id)), shown, "v1 and MCP");
+  const agent = await get("/api/v1/agent/latest?mode=all&limit=30");
+  assert.equal(agent.status, 200);
+  assert.ok(agent.body.includes(id("edge")) && !agent.body.includes(id("low")), "Agent latest");
+  const rss = await itemFeed("all", null, { now });
+  assert.ok(rss.includes(id("edge")) && rss.includes(id("unscored")) && !rss.includes(id("low")), "all RSS");
+
+  const found = await loadPool({ channel: "all", category: null, tag: `${T}-floor`, q: id("low"), now });
+  assert.deepEqual(ours(found.items.map((i) => i.id)), [id("low")], "web search");
+  const searched = await v1Items({ mode: "all", window: "24h", by: "timeline", category: null, q: id("low"), limit: 100, cursor: null }, now);
+  assert.deepEqual(ours(searched.items.map((i) => i.id)), [id("low")], "v1 search");
 });

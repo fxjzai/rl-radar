@@ -7,10 +7,12 @@ import { closeDb, sql } from "@aihot/backend/db";
 import { upsertMaterial } from "@aihot/backend/content/materials";
 import { getBoss, stopBoss } from "@aihot/backend/jobs/queue";
 import { checkAlerts, collectFindings, providerStops, sendDigest } from "@aihot/backend/operations/alerts";
-import { CAPABILITIES, capabilities, invalidateModelCache, modelFor } from "@aihot/backend/editorial/models";
+import { CAPABILITIES, invalidateModelCache, modelFor, modelRoute, stepsOnService } from "@aihot/backend/editorial/models";
 import { installModules, serverModules } from "@aihot/backend/modules";
 import { MODELS } from "@aihot/backend/providers/llm";
+import { assertAccepted, paidRequest } from "@aihot/backend/providers/receipts";
 import { READER_WORDING } from "@aihot/industry/wording";
+import { resolveDelivery } from "@aihot/backend/notify/deliver";
 import { runsOverview } from "@aihot/backend/admin/runs";
 
 process.env.COLLECT_ENABLED = "false";
@@ -27,7 +29,11 @@ before(async () => {
     const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.com/${T}-${i}`, title: `stuck ${i}`, bodyStatus: "none", via: "fetch" });
     stuckIds.push(articleId);
   }
+  // One left over from yesterday: it outlives this episode, so it must not be what dates it.
+  const { articleId: straggler } = await upsertMaterial({ sourceId: SOURCE, url: `https://example.com/${T}-old`, title: "stuck since yesterday", bodyStatus: "none", via: "fetch" });
+  stuckIds.push(straggler);
   await sql`UPDATE articles SET discovered_at = now() - interval '3 hours', processing_state = 'new' WHERE id IN ${sql(stuckIds)}`;
+  await sql`UPDATE articles SET discovered_at = now() - interval '40 hours' WHERE id = ${straggler}`;
 });
 after(async () => {
   await stopBoss();
@@ -43,6 +49,12 @@ test("an outage is announced once, repeated hourly, and closed with one recovery
 
     let r = await checkAlerts(t0);
     assert.deepEqual(stuck(r.sent), ["content.process"]);
+    // The episode is dated from when it was first seen: the article left over from yesterday is a fact in
+    // the detail, not the start of a backlog that built up in the last three hours.
+    const [state] = await sql<{ value: Record<string, { since: string }> }[]>`SELECT value FROM settings WHERE key = 'alerts.state'`;
+    assert.equal(Date.parse(state!.value["content.process"]!.since), t0, "the episode is not dated by the oldest waiting article");
+    const finding = (await collectFindings(t0)).find((f) => f.key === "content.process")!;
+    assert.match(finding.detail!, /最老的一篇 .* 收进/);
     r = await checkAlerts(t0 + 50 * 60_000);
     assert.deepEqual(stuck(r.sent), [], "no repeat within the hour");
     r = await checkAlerts(t0 + 61 * 60_000);
@@ -59,109 +71,138 @@ test("an outage is announced once, repeated hourly, and closed with one recovery
   }
 });
 
-// Backup failures may overwrite the latest-attempt summary. Alert age must use the last successful
-// run; repeated failures must not reset it. With no success ever, age starts at the first attempt.
-test("a model service's outage names the steps that call it, not the wording step while the word list is empty", async () => {
-  const service = MODELS[await modelFor("wording")]!.service;
-  const wording = CAPABILITIES.wording.label.split("（")[0]!;
-  const list = READER_WORDING as Array<readonly [RegExp, string]>;
-  const kept = list.splice(0);
+// 10-26 16:00–19:00 the egress proxy dropped: a quarter of the sources fetched each hour failed while the others
+// kept bringing articles, so the stall alert stayed quiet and nobody heard. A handful failing is theirs to follow up.
+test("many sources failing within the hour is announced while the rest still collect", async () => {
+  process.env.COLLECT_ENABLED = "true";
+  const now = Date.now();
+  const ids = Array.from({ length: 300 }, (_, i) => `${SOURCE}-fetch-${i}`);
+  const run = (some: string[], status: "ok" | "failed", minutesAgo: number) => sql`
+    INSERT INTO fetch_runs (source_id, started_at, finished_at, status, error)
+    SELECT id, ${new Date(now - minutesAgo * 60_000)}, ${new Date(now - minutesAgo * 60_000)}, ${status},
+      ${status === "failed" ? "Client network socket disconnected before secure TLS connection was established" : null}
+    FROM unnest(${some}::text[]) id`;
+  const fetching = async (at = now, open?: Parameters<typeof collectFindings>[1]) =>
+    (await collectFindings(at, open)).find((f) => f.key === "content.fetch");
   try {
-    assert.ok(!(await providerStops(service)).includes(wording), "nothing to look for: the step never calls a model");
-    list.push([/禁用词/u, "换一个说法"]);
-    assert.ok((await providerStops(service)).includes(wording));
+    await sql`INSERT INTO sources (id, name, kind, next_fetch_at) SELECT id, id, 'rss', '2100-01-01' FROM unnest(${ids}::text[]) id`;
+    await run(ids, "ok", 90);
+    await run(ids.slice(60), "ok", 20);
+    await run(ids.slice(0, 49), "failed", 20);
+    assert.equal(await fetching(), undefined, "49 failing sources are each one's own follow-up");
+    await run(ids.slice(49, 60), "failed", 15);
+    const finding = await fetching();
+    assert.equal(finding?.level, "now");
+    assert.match(finding!.impact!, /300 个信源.*60 个/);
+    assert.equal(finding!.since!.getTime(), now - 20 * 60_000, "dated by the first failure still standing");
+    // A failing source is not fetched again for hours (its backoff), while the others keep being fetched: neither
+    // time passing nor more successes elsewhere is recovery. Nor is pausing collection.
+    const open = { "content.fetch": { title: finding!.title, since: finding!.since!.toISOString() } };
+    const later = now + 2 * 3600_000;
+    await run(ids.slice(60), "ok", -100);
+    assert.equal((await fetching(later))?.key, "content.fetch", "still failing two hours on, with nothing refetched");
+    process.env.COLLECT_ENABLED = "false";
+    const resumed = now + 9 * 3600_000;
+    assert.equal((await fetching(resumed, open))?.key, "content.fetch", "paused nine hours: nothing proven");
+    process.env.COLLECT_ENABLED = "true";
+    await run(ids.slice(60), "ok", -535);
+    assert.equal((await fetching(resumed))?.key, "content.fetch", "resumed: the others fetched first prove nothing about these");
+    await run(ids.slice(0, 60), "ok", -538);
+    assert.equal(await fetching(resumed), undefined, "a source whose next fetch worked no longer counts");
   } finally {
-    list.splice(0, list.length, ...kept);
+    await sql`DELETE FROM sources WHERE id IN ${sql(ids)}`;
+    process.env.COLLECT_ENABLED = "false";
   }
 });
 
-test("provider impacts follow the current model choice, including overrides, fallback and module steps", async () => {
-  const env = process.env.SCORE_MODEL;
-  const moduleEnv = process.env.ALERT_TEST_MODEL;
+// A restart, a paused valve, or old failures leaving the initial detection window cannot
+// close an open incident. A partial repair must keep the remaining work visible.
+test("content incidents survive restarts, pauses, aging failures and partial recovery", async () => {
+  process.env.COLLECT_ENABLED = "true";
+  process.env.MODEL_CALLS_ENABLED = "true";
+  const now = Date.now();
+  const sent = (result: Awaited<ReturnType<typeof checkAlerts>>) => result.sent.filter(k => k.startsWith("content.process"));
+  try {
+    await sql`UPDATE articles SET processing_state='new',discovered_at=${new Date(now - 3 * 3600_000)} WHERE id IN ${sql(stuckIds)}`;
+    assert.deepEqual(sent(await checkAlerts(now)), ["content.process"]);
+    await sql`INSERT INTO settings(key,value) VALUES('heartbeat.worker',${sql.json({ startedAt: new Date(now + 60_000).toISOString() })})`;
+    assert.deepEqual(sent(await checkAlerts(now + 2 * 60_000)), [], "a restart does not resolve the backlog");
+    assert.ok((await collectFindings(now + 2 * 60_000)).some(f => f.key === "content.process"));
+    process.env.MODEL_CALLS_ENABLED = "false";
+    assert.deepEqual(sent(await checkAlerts(now + 3 * 60_000)), [], "pausing processing is not recovery");
+    process.env.MODEL_CALLS_ENABLED = "true";
+    await sql`UPDATE articles SET discovered_at=${new Date(now - 3600_000)} WHERE id IN ${sql(stuckIds)}`;
+    assert.deepEqual(sent(await checkAlerts(now + 4 * 60_000)), [], "requeued failed work is not complete before the two-hour waiting threshold");
+    await sql`UPDATE articles SET processing_state='failed',discovered_at=${new Date(now - 2 * 3600_000)} WHERE id IN ${sql(stuckIds)}`;
+    assert.deepEqual(sent(await checkAlerts(now + 2 * 3600_000)), ["content.process"], "unresolved failures do not age out");
+    await sql`UPDATE articles SET processing_state='analyzed' WHERE id IN ${sql(stuckIds.slice(1))}`;
+    assert.deepEqual(sent(await checkAlerts(now + 2 * 3600_000 + 60_000)), [], "one unfinished article still blocks recovery");
+    await sql`UPDATE articles SET processing_state='analyzed' WHERE id=${stuckIds[0]!}`;
+    assert.deepEqual(sent(await checkAlerts(now + 2 * 3600_000 + 2 * 60_000)), ["content.process:recovered"]);
+  } finally {
+    await sql`DELETE FROM settings WHERE key='heartbeat.worker'`;
+    await sql`UPDATE articles SET processing_state='analyzed' WHERE id IN ${sql(stuckIds)}`;
+    process.env.COLLECT_ENABLED = "false";
+    process.env.MODEL_CALLS_ENABLED = "false";
+  }
+});
+
+// Alerts about a paid service name the steps currently routed to it: the admin choice, else a valid
+// environment choice, else the site default. Failed calls a step made before it moved do not list it;
+// module steps count alike, and a step with nothing to do (an empty word list) is left out.
+test("refusal and spent-budget alerts name the steps currently routed to the provider", async () => {
+  const label = CAPABILITIES.score.label.split("（")[0]!;
+  const fallback = CAPABILITIES.score.default;
+  const other = Object.keys(MODELS).find((key) => MODELS[key]!.service !== MODELS[fallback]!.service)!;
+  const services = [MODELS[fallback]!.service, MODELS[other]!.service];
   const installed = serverModules();
-  const stepEnvs = Object.fromEntries(Object.values(capabilities()).map((step) => [step.env, process.env[step.env]]));
-  const label = CAPABILITIES.score.label.split("（")[0]!;
-  const defaultService = MODELS[CAPABILITIES.score.default]!.service;
-  const other = Object.keys(MODELS).find((key) => MODELS[key]!.service !== defaultService)!;
-  const otherService = MODELS[other]!.service;
-  const scoreOn = async (service: string) => (await providerStops(service)).includes(label);
-  try {
-    await sql`DELETE FROM settings WHERE key = 'models.score'`;
-    invalidateModelCache();
-    delete process.env.SCORE_MODEL;
-    assert.equal(await scoreOn(defaultService), true, "the code default is used without overrides");
-    process.env.SCORE_MODEL = other;
-    assert.equal(await modelFor("score"), other);
-    assert.equal(await scoreOn(defaultService), false, "the old provider no longer lists scoring");
-    assert.equal(await scoreOn(otherService), true, "the environment-selected provider lists scoring");
-
-    await sql`INSERT INTO settings(key,value) VALUES ('models.score', ${sql.json({ model: CAPABILITIES.score.default })})`;
-    invalidateModelCache();
-    assert.equal(await scoreOn(defaultService), true, "the admin choice takes precedence over the environment");
-    assert.equal(await scoreOn(otherService), false);
-    await sql`UPDATE settings SET value = ${sql.json({ model: "unknown-model" })} WHERE key = 'models.score'`;
-    invalidateModelCache();
-    assert.equal(await scoreOn(otherService), true, "an invalid admin choice yields to a valid environment choice");
-    process.env.SCORE_MODEL = "unknown-model";
-    assert.equal(await modelFor("score"), CAPABILITIES.score.default);
-    assert.equal(await scoreOn(defaultService), true, "an invalid environment choice falls back to the default");
-
-    installModules([...installed, { name: "alert-test", models: { alertTest: { label: "模块测试步骤（说明）", env: "ALERT_TEST_MODEL", purposes: [] } } }]);
-    process.env.ALERT_TEST_MODEL = other;
-    assert.ok((await providerStops(otherService)).includes("模块测试步骤"));
-    await sql`INSERT INTO settings(key,value) VALUES ('models.alertTest', ${sql.json({ model: CAPABILITIES.score.default })})`;
-    invalidateModelCache();
-    assert.ok(!(await providerStops(otherService)).includes("模块测试步骤"));
-    assert.ok((await providerStops(defaultService)).includes("模块测试步骤"));
-
-    for (const step of Object.values(capabilities())) process.env[step.env] = other;
-    await sql`DELETE FROM settings WHERE key LIKE 'models.%'`;
-    invalidateModelCache();
-    assert.doesNotMatch(await providerStops(defaultService), /步骤停了|精选/,
-      "a provider used only by historical calls must not claim current processing has stopped");
-    assert.equal(await providerStops("jina"), "部分文章取不到正文");
-  } finally {
-    installModules(installed);
-    for (const [key, value] of Object.entries(stepEnvs)) {
-      if (value === undefined) delete process.env[key]; else process.env[key] = value;
-    }
-    await sql`DELETE FROM settings WHERE key IN ('models.score', 'models.alertTest')`;
-    invalidateModelCache();
-    if (env === undefined) delete process.env.SCORE_MODEL; else process.env.SCORE_MODEL = env;
-    if (moduleEnv === undefined) delete process.env.ALERT_TEST_MODEL; else process.env.ALERT_TEST_MODEL = moduleEnv;
-  }
-});
-
-test("refusal and exhausted-budget findings name the currently selected provider's steps", async () => {
-  const env = process.env.SCORE_MODEL;
-  const label = CAPABILITIES.score.label.split("（")[0]!;
-  const defaultService = MODELS[CAPABILITIES.score.default]!.service;
-  const other = Object.keys(MODELS).find((key) => MODELS[key]!.service !== defaultService)!;
-  const service = MODELS[other]!.service;
-  try {
-    process.env.SCORE_MODEL = other;
-    await sql`INSERT INTO receipts(logical_key,service,purpose,status) VALUES ('alert-provider-routing',${service},'score_article','failed')`;
-    const [receipt] = await sql<{ id: number }[]>`SELECT id FROM receipts WHERE logical_key='alert-provider-routing'`;
+  const envs = Object.fromEntries(["SCORE_MODEL", "ALERT_TEST_MODEL"].map((key) => [key, process.env[key]]));
+  const budgets = await sql`SELECT * FROM budgets WHERE service IN ${sql(services)}`;
+  // Both services refused three scoring calls in the last hour and spent their daily budget.
+  for (const service of services) {
+    const [receipt] = await sql<{ id: number }[]>`INSERT INTO receipts(logical_key,service,purpose,status)
+      VALUES (${`alert-routing-${service}`},${service},'score_article','failed') RETURNING id`;
     for (let attempt = 1; attempt <= 3; attempt++) {
       await sql`INSERT INTO receipt_attempts(receipt_id,service,attempt,status,error,origin)
         VALUES(${receipt!.id},${service},${attempt},'failed','HTTP 402 insufficient balance','live')`;
     }
     await sql`INSERT INTO budgets(service,per_minute,per_hour,per_day) VALUES(${service},0,0,3) ON CONFLICT(service) DO UPDATE SET per_day=3`;
-    const findings = await collectFindings();
-    for (const key of [`provider.refused.${service}`, `budget.day.${service}`]) {
-      const impact = findings.find((f) => f.key === key)?.impact;
-      assert.ok(impact?.includes(label), `${key} lists scoring on its current provider`);
-      assert.doesNotMatch(impact!, /\[object Promise\]/);
+  }
+  try {
+    for (const [route, env, admin, current] of [
+      ["the site default", undefined, undefined, services[0]],
+      ["an environment choice", other, undefined, services[1]],
+      ["the admin choice over the environment", other, fallback, services[0]],
+      ["a valid environment choice over an unknown admin choice", other, "unknown-model", services[1]],
+      ["the default over an unknown environment choice", "unknown-model", undefined, services[0]],
+    ] as const) {
+      if (env === undefined) delete process.env.SCORE_MODEL; else process.env.SCORE_MODEL = env;
+      await sql`DELETE FROM settings WHERE key = 'models.score'`;
+      if (admin) await sql`INSERT INTO settings(key,value) VALUES ('models.score', ${sql.json({ model: admin })})`;
+      invalidateModelCache();
+      const findings = await collectFindings();
+      for (const service of services) for (const key of [`provider.refused.${service}`, `budget.day.${service}`]) {
+        assert.equal(findings.find((f) => f.key === key)!.impact!.includes(label), service === current, `${route}: ${key}`);
+      }
     }
+    installModules([...installed, { name: "alert-test", models: { alertTest: { label: "模块测试步骤（说明）", env: "ALERT_TEST_MODEL", purposes: [] } } }]);
+    process.env.ALERT_TEST_MODEL = other;
+    assert.ok((await providerStops(services[1]!)).includes("模块测试步骤"));
+    const wording = CAPABILITIES.wording.label.split("（")[0]!;
+    assert.equal((await providerStops(MODELS[await modelFor("wording")]!.service)).includes(wording), READER_WORDING.length > 0);
   } finally {
-    await sql`DELETE FROM receipt_attempts WHERE receipt_id IN (SELECT id FROM receipts WHERE logical_key='alert-provider-routing')`;
-    await sql`DELETE FROM receipts WHERE logical_key='alert-provider-routing'`;
-    await sql`DELETE FROM budgets WHERE service=${service}`;
-    if (env === undefined) delete process.env.SCORE_MODEL; else process.env.SCORE_MODEL = env;
+    installModules(installed);
+    for (const [key, value] of Object.entries(envs)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    await sql`DELETE FROM settings WHERE key = 'models.score'`;
+    await sql`DELETE FROM receipts WHERE logical_key LIKE 'alert-routing-%'`;
+    await sql`DELETE FROM budgets WHERE service IN ${sql(services)}`;
+    if (budgets.length) await sql`INSERT INTO budgets ${sql(budgets)}`;
     invalidateModelCache();
   }
 });
 
+// Backup failures may overwrite the latest-attempt summary. Alert age must use the last successful
+// run; repeated failures must not reset it. With no success ever, age starts at the first attempt.
 test("backup failures still escalate after fifty hours without a success", async () => {
   Object.assign(process.env, {
     DB_BACKUP_STORE_SECRET_ID: "test-backup-key", DB_BACKUP_STORE_SECRET_KEY: "test-backup-secret",
@@ -240,8 +281,14 @@ test("selected identity delays show reader impact, recovery state and the affect
     assert.match(warning!.heals!, /人工|处理后/);
     assert.match(warning!.detail!, new RegExp(`#${receipt!.id}`));
 
+    await checkAlerts(now);
+    await sql`UPDATE articles SET grouping_status='complete' WHERE id IN ('group-alert-brief','group-alert-revision')`;
+    await sql`UPDATE publications SET selected_ready_at=${new Date(now)} WHERE article_id='group-alert-failed'`;
+    assert.ok((await finding())?.key, "restarting identity work must not hide an open incident for another ten minutes");
+    assert.ok(!(await checkAlerts(now + 60_000)).sent.includes("content.grouping:recovered"));
     await sql`UPDATE articles SET grouping_status='complete',grouped_at=now(),grouping_receipt_id=NULL WHERE id='group-alert-failed'`;
     assert.equal(await finding(), undefined, "successful identity repair clears the reader-impact finding");
+    assert.ok((await checkAlerts(now + 2 * 60_000)).sent.includes("content.grouping:recovered"));
     assert.equal((await runsOverview()).grouping.needsAttention, 0);
   } finally {
     process.env.COLLECT_ENABLED = "false";
@@ -251,6 +298,7 @@ test("selected identity delays show reader impact, recovery state and the affect
     await sql`DELETE FROM sources WHERE id=${source}`;
     await sql`DELETE FROM receipt_attempts WHERE receipt_id IN (SELECT id FROM receipts WHERE logical_key='group-alert-receipt')`;
     await sql`DELETE FROM receipts WHERE logical_key='group-alert-receipt'`;
+    await sql`UPDATE settings SET value=value-'content.grouping' WHERE key='alerts.state'`;
   }
 });
 
@@ -270,5 +318,157 @@ test("the ops digest does not describe unknown paid work as harmless or already 
     console.log = log;
     if (enabled === undefined) delete process.env.FEISHU_INTERNAL_ENABLED;
     else process.env.FEISHU_INTERNAL_ENABLED = enabled;
+  }
+});
+
+// The request and alert layers must agree: TPM quota errors are temporary, spending
+// refusals need attention, and an unrelated input error mentioning "balance" is not an outage.
+test("provider alerts use the same 429 spending classification as paid requests", async () => {
+  const cases: [string, number, unknown, boolean][] = [
+    ["zhipu", 429, { error: { code: "1113", message: "account unavailable" } }, true],
+    ["dashscope", 429, { error: { code: "insufficient_quota", message: "You exceeded your current quota, please check your plan and billing details." } }, false],
+    ["dashscope", 429, { code: "BudgetLimitExceeded", message: "budget reached" }, true],
+    ["llm", 429, { error: { message: "x".repeat(900), code: "credit_balance_exhausted" } }, true],
+    ["mimo", 400, { error: { message: "invalid balance parameter" } }, false],
+  ];
+  for (const [service, status, body, expected] of cases) {
+    const purpose = `alert-429-${tag()}`;
+    try {
+      await assert.rejects(paidRequest({ service, purpose, identity: purpose }, async () => {
+        assertAccepted(service, status, JSON.stringify(body));
+        return { response: null };
+      }));
+      const finding = (await collectFindings()).find(f => f.key === `provider.refused.${service}`);
+      assert.equal(!!finding, expected, `${service}: ${JSON.stringify(body)}`);
+      if (finding) assert.equal(finding.owner, true, "only the owner can pay or fix the account");
+    } finally {
+      await sql`DELETE FROM receipts WHERE purpose=${purpose}`;
+    }
+  }
+});
+
+// Window expiry, resending and an explicit drop are not successful delivery.
+test("failed deliveries remain open after a day and through resend until confirmed", async () => {
+  const now = Date.now();
+  await sql`INSERT INTO notify_targets(key,purpose,kind) VALUES('lifecycle','content','log')`;
+  const [d] = await sql<{ id: number }[]>`INSERT INTO deliveries(target_key,subject_kind,subject_id,dedupe_key,status,updated_at)
+    VALUES('lifecycle','test','1','1','failed',now()-interval '23 hours') RETURNING id`;
+  assert.ok((await checkAlerts(now)).open.includes("deliveries.failed"));
+  assert.ok((await checkAlerts(now+25*3600_000)).open.includes("deliveries.failed"), "age does not resend the card");
+  await sql`UPDATE deliveries SET status='sending',attempts=1,updated_at=now() WHERE id=${d!.id}`;
+  assert.ok((await checkAlerts(now+25*3600_000+60_000)).open.includes("deliveries.failed"), "starting the resend is not arrival");
+  await sql`UPDATE deliveries SET status='unknown' WHERE id=${d!.id}`;
+  await resolveDelivery(d!.id, {outcome:"sent",note:"confirmed in group"}, "test");
+  assert.ok((await checkAlerts(now+25*3600_000+120_000)).sent.includes("deliveries.failed:recovered"));
+});
+
+test("a refused provider stays open without a newer successful call", async () => {
+  const now=Date.now();
+  const [r]=await sql<{id:number}[]>`INSERT INTO receipts(logical_key,service,purpose,status) VALUES('lifecycle-refusal','deepseek','summarize_article','failed') RETURNING id`;
+  for(let n=1;n<=3;n++) await sql`INSERT INTO receipt_attempts(receipt_id,attempt,service,status,error) VALUES(${r!.id},${n},'deepseek','failed','deepseek HTTP 402 insufficient balance')`;
+  assert.ok((await checkAlerts(now)).open.includes("provider.refused.deepseek"));
+  await sql`UPDATE receipt_attempts SET started_at=now()-interval '2 hours' WHERE receipt_id=${r!.id}`;
+  assert.ok((await checkAlerts(now+2*3600_000)).open.includes("provider.refused.deepseek"), "silence cannot establish restored access");
+  await sql`INSERT INTO receipt_attempts(receipt_id,attempt,service,status) VALUES(${r!.id},4,'deepseek','received')`;
+  assert.ok((await checkAlerts(now+2*3600_000+60_000)).sent.includes("provider.refused.deepseek:recovered"));
+});
+
+test("a deliberately dropped delivery closes without claiming successful delivery", async () => {
+  const now = Date.now();
+  const [d] = await sql<{ id: number }[]>`INSERT INTO deliveries(target_key,subject_kind,subject_id,dedupe_key,status)
+    VALUES('lifecycle','test','drop','drop','failed') RETURNING id`;
+  await checkAlerts(now);
+  await resolveDelivery(d!.id, { outcome: "drop", note: "owner accepted the missing old card" }, "test");
+  const result = await checkAlerts(now + 60_000);
+  assert.ok(result.sent.includes("deliveries.failed:closed"));
+  assert.ok(!result.sent.includes("deliveries.failed:recovered"));
+});
+
+// Success on a different model proves neither the old allowance nor the old work recovered.
+// Switching away changes the current impact, while the unresolved old limit remains explicit.
+test("provider recovery follows the refused model and current routing", async () => {
+  const now = Date.now();
+  const before = process.env.PREFILTER_MODEL;
+  const beforeFeedback = process.env.FEEDBACK_MODEL;
+  process.env.PREFILTER_MODEL = "qwen3.7-flash";
+  // The other step on this model stays away, so the prefilter's switch below leaves it unused.
+  process.env.FEEDBACK_MODEL = "qwen3.8-flash";
+  const [r] = await sql<{ id: number }[]>`INSERT INTO receipts(logical_key,service,model,purpose,status)
+    VALUES('refusal-model-scope','dashscope','qwen3.7-flash','prefilter_article','failed') RETURNING id`;
+  try {
+    for (let attempt = 1; attempt <= 3; attempt++) await sql`INSERT INTO receipt_attempts(receipt_id,attempt,service,model,status,error)
+      VALUES(${r!.id},${attempt},'dashscope','qwen3.7-flash','failed','dashscope HTTP 429: {"code":"BudgetLimitExceeded"}')`;
+    await checkAlerts(now);
+    await sql`UPDATE receipt_attempts SET started_at=now()-interval '2 hours' WHERE receipt_id=${r!.id}`;
+    await sql`INSERT INTO receipt_attempts(receipt_id,attempt,service,model,status)
+      VALUES(${r!.id},4,'dashscope','qwen3.8-flash','received')`;
+    assert.ok((await checkAlerts(now+2*3600_000)).open.includes('provider.refused.dashscope:qwen3.7-flash'), 'another model cannot prove recovery');
+    let finding=(await collectFindings(now+2*3600_000)).find(f=>f.key==='provider.refused.dashscope:qwen3.7-flash')!;
+    assert.match(finding.impact!, /精选预筛/);
+    assert.doesNotMatch(finding.impact!, /结构抽取/);
+    process.env.PREFILTER_MODEL = "qwen3.8-flash";
+    invalidateModelCache();
+    finding=(await collectFindings(now+2*3600_000)).find(f=>f.key==='provider.refused.dashscope:qwen3.7-flash')!;
+    assert.equal(finding.level,'later');
+    assert.match(finding.impact!, /当前.*未使用.*旧限制.*未验证/);
+    assert.ok(!(await checkAlerts(now+2*3600_000+60_000)).sent.includes('provider.refused.dashscope:qwen3.7-flash:recovered'));
+    await sql`INSERT INTO receipt_attempts(receipt_id,attempt,service,model,status)
+      VALUES(${r!.id},5,'dashscope','qwen3.7-flash','received')`;
+    assert.ok((await checkAlerts(now+2*3600_000+120_000)).sent.includes('provider.refused.dashscope:qwen3.7-flash:recovered'));
+  } finally {
+    if (before===undefined) delete process.env.PREFILTER_MODEL; else process.env.PREFILTER_MODEL=before;
+    if (beforeFeedback===undefined) delete process.env.FEEDBACK_MODEL; else process.env.FEEDBACK_MODEL=beforeFeedback;
+    invalidateModelCache();
+    await sql`DELETE FROM receipts WHERE id=${r!.id}`;
+  }
+});
+
+// The evaluated fallback is an active route even when no primary uses that supplier.
+test("provider impact includes the same evaluated fallback as modelRoute", async () => {
+  const envs = Object.fromEntries(Object.values(CAPABILITIES).map(c => [c.env, process.env[c.env]]));
+  MODELS["test-primary"] = { ...MODELS["deepseek-flash"]!, key: "test-primary" };
+  MODELS["test-backup"] = { ...MODELS["glm-5.3-flash"]!, key: "test-backup", fallbackFor: { summarize: "test-primary" } };
+  try {
+    for (const c of Object.values(CAPABILITIES)) process.env[c.env] = "test-primary";
+    invalidateModelCache();
+    const route = await modelRoute("summarize");
+    assert.equal(route.fallbackModel, "test-backup");
+    const steps = await stepsOnService("zhipu", new Set(["glm-5.3-flash"]));
+    assert.ok(steps.includes("标题摘要"), "the fallback can fail and stop articles even without a primary on this supplier");
+    assert.ok(!steps.includes("精选评分"), "an unevaluated fallback is not invented for other steps");
+  } finally {
+    for (const [key, value] of Object.entries(envs)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    delete MODELS["test-primary"];
+    delete MODELS["test-backup"];
+    invalidateModelCache();
+  }
+});
+
+test("a refusal first seen after switching models survives the first-hour window", async () => {
+  const before = process.env.PREFILTER_MODEL;
+  const beforeFeedback = process.env.FEEDBACK_MODEL;
+  const now = Date.now();
+  process.env.PREFILTER_MODEL = "qwen3.8-flash";
+  process.env.FEEDBACK_MODEL = "qwen3.8-flash";
+  invalidateModelCache();
+  const key = "provider.refused.dashscope:qwen3.7-flash";
+  const [r] = await sql<{ id: number }[]>`INSERT INTO receipts(logical_key,service,model,purpose,status)
+    VALUES('refusal-already-switched','dashscope','qwen3.7-flash','prefilter_article','failed') RETURNING id`;
+  try {
+    await sql`INSERT INTO receipt_attempts(receipt_id,attempt,service,model,status,error,started_at)
+      VALUES(${r!.id},1,'dashscope','qwen3.7-flash','failed','dashscope HTTP 429: {"code":"BudgetLimitExceeded"}',${new Date(now-60_000)})`;
+    await checkAlerts(now);
+    const finding = (await collectFindings(now+2*3600_000)).find(f => f.key===key);
+    assert.equal(finding?.level, "later", "a switched-away limit is still unverified after the detection window");
+    await sql`INSERT INTO receipt_attempts(receipt_id,attempt,service,model,status,started_at)
+      VALUES(${r!.id},2,'dashscope','qwen3.7-flash','received',${new Date(now+2*3600_000)})`;
+    const recovered = await checkAlerts(now+2*3600_000+60_000);
+    assert.ok(!recovered.open.includes(key));
+    assert.ok(!recovered.sent.includes(`${key}:recovered`), "an incident never announced separately has no unsolicited recovery notice");
+  } finally {
+    if (before===undefined) delete process.env.PREFILTER_MODEL; else process.env.PREFILTER_MODEL=before;
+    if (beforeFeedback===undefined) delete process.env.FEEDBACK_MODEL; else process.env.FEEDBACK_MODEL=beforeFeedback;
+    invalidateModelCache();
+    await sql`DELETE FROM receipts WHERE id=${r!.id}`;
   }
 });

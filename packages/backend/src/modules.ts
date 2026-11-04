@@ -21,21 +21,6 @@ export interface Scheduled {
   when?: () => boolean;
 }
 
-/**
- * A module's notification routing policy (ServerModule.responder):
- * the owner hears only what it hands back; held findings do not imply recovery.
- */
-export interface Responder {
-  /**
-   * Every problem the alerts check found (operations/alerts.ts); a problem it held that is missing has ended.
-   * `tell` is what the owner should hear about now; `held` names the problems still open, so the owner is not
-   * told that something they heard about earlier has ended while it lasts.
-   */
-  take: (found: Finding[], now: number) => Promise<{ tell: Finding[]; held: string[] }>;
-  /** A problem found while the alerts check cannot run (operations/watch.ts: the worker is down); what the owner should hear about it, if anything. */
-  raise: (found: Finding, now: number) => Promise<Finding | null>;
-}
-
 /** A model step (editorial/models.ts); its default model comes from site/models.ts, else `default`. */
 export interface ModelStep {
   label: string;
@@ -68,8 +53,6 @@ export interface AgentAbility {
     use: string;
     description: string;
     input: z.ZodObject;
-    /** Optional successful empty-site call for scripts/mcp-check.ts; without it, only inputs accepting {} are called. */
-    checkArgs?: Record<string, unknown>;
     /** The text (the same answer) and the structured content. */
     run: (args: Record<string, unknown>) => Promise<{ text: string; structured: Record<string, unknown> }>;
   };
@@ -146,6 +129,14 @@ export interface EngineHooks {
   exitServed: (exit: string, req: FastifyRequest) => void;
 }
 
+/** A use of sources a module declares (ServerModule.sourceUses). */
+export interface SourceUse {
+  /** Its name in the admin's source list. */
+  label: string;
+  /** The longest it lets its sources wait between reads, in minutes; a faster pace of their own stays. */
+  minutes?: number;
+}
+
 /** What a topic page asks a module's part of it (publication/topics.ts loadTopicPage). */
 export interface TopicPageAsk {
   topic: Topic;
@@ -165,35 +156,9 @@ export interface JsonNotice {
   private?: boolean;
 }
 
-/** A reminder over MCP: after the server's instructions, after every tool's text and as `notice` in its structured content. */
-export interface McpNotice {
-  instructions: string;
-  text: string;
-  notice: object;
-}
-
-/** A reminder in a feed: an item ahead of the feed's own. `description` is HTML. */
-export interface FeedNotice {
-  guid: string;
-  title: string;
-  link: string;
-  description: string;
-  at: Date;
-}
-
-/**
- * A reminder for the person behind a request, which their Agent or reader passes on (it is not content),
- * asked at each exit; the first module with one gives it (requestNotice).
- */
+/** A reminder for the person behind a JSON request; the first module with one gives it. */
 export interface RequestNotices {
-  /** v1 JSON (routes/v1.ts). */
   json: (req: FastifyRequest) => JsonNotice | null;
-  /** The Agent's Markdown answers (routes/agent.ts): Markdown after the answer. */
-  agent: (req: FastifyRequest) => string | null;
-  /** MCP (routes/mcp.ts). Each distinct reminder gets a server of its own. */
-  mcp: (req: FastifyRequest) => McpNotice | null;
-  /** RSS (routes/feeds.ts), for the feed at `feedPath`. */
-  feed: (req: FastifyRequest, feedPath: string) => FeedNotice | null;
 }
 
 export interface ServerModule {
@@ -201,6 +166,8 @@ export interface ServerModule {
   name: string;
   /** Sources whose selected articles keep independent cards/seats without changing admission or event identity (publication/rules.ts, scope.ts). */
   independentSelectedSources?: readonly string[];
+  /** Another account of an independent source's author, by source id: its post gives way to the article on the same news (events/cards.ts). */
+  independentSelectedEchoes?: Readonly<Record<string, string>>;
   /** Its HTTP routes, and hooks on the app such as what to flush when it closes, registered before the engine's v1 fallbacks (apps/api/src/app.ts). */
   http?: (app: FastifyInstance) => void;
   agent?: {
@@ -212,30 +179,14 @@ export interface ServerModule {
   };
   llms?: () => Promise<LlmsLines> | LlmsLines;
   sitemap?: {
-    /** After the engine's content pages (the topics), before the site's own (agent, about, terms). */
-    pages?: SitemapEntry[];
     /** After the stories. */
     entries?: () => Promise<SitemapEntry[]>;
-  };
-  admin?: {
-    /** Current jobs scheduled outside the worker, by their job_runs name (admin/runs.ts). */
-    currentJobs?: () => Promise<readonly string[]>;
-    /** Badges on the admin navigation, by the key its web items name (admin/navigation.ts). */
-    counts?: Record<string, () => Promise<number>>;
-    /** Its part of the admin's runs page, under its name (admin/runs.ts); its web module draws it. */
-    runs?: () => Promise<unknown>;
   };
   models?: Record<string, ModelStep>;
   /** Cron schedules (the worker). */
   schedules?: Scheduled[];
   /** What is wrong now, for the owner's alerts (operations/alerts.ts), after the engine's problems. */
   alerts?: (now: number) => Promise<Finding[]>;
-  /**
-   * Chooses which problems the owner hears about: the first installed module with one (operations/alerts.ts,
-   * operations/watch.ts). What it holds back is the module's to hand to whoever handles it; with one, the
-   * daily digest and the weekly source report have no schedule (apps/worker/src/schedules.ts).
-   */
-  responder?: Responder;
   /** Its share of the daily retention run (operations/retention.ts): what it deleted or aggregated. */
   retention?: (now: Date) => Promise<Record<string, unknown>>;
   on?: Partial<EngineHooks>;
@@ -268,18 +219,19 @@ export interface ServerModule {
     resumed?: (sourceId: string, tx: Db) => Promise<void>;
     fetchNow?: (source: { id: string; config: Record<string, unknown> }) => Promise<Record<string, unknown>>;
   }>;
+  /**
+   * Uses of sources besides the news pipeline, by name (sources.uses, sources/uses.ts): the module reads the
+   * articles of the sources that name one itself, so nothing is collected twice.
+   */
+  sourceUses?: Record<string, SourceUse>;
   /** Lines of the Monday source-health report (operations/reports.ts), after the source counts. */
   sourceHealth?: (now: number) => Promise<string[]>;
   /** Job queues of its own (jobs/queue.ts). */
   queues?: ModuleQueue[];
   /** Follow-ups (level later), after the engine's (operations/alerts.ts). */
   followUps?: (now: number) => Promise<Finding[]>;
-  /** Further hosts the site answers on, over https: MCP accepts them as Host and as a browser's Origin (routes/mcp.ts). */
-  hosts?: string[];
-  /** Reminders for the person behind a request, by exit (RequestNotices). */
+  /** Reminders for the person behind a JSON request (RequestNotices). */
   notices?: Partial<RequestNotices>;
-  /** The origin v1 links stories at while it returns one, instead of the site's (publication/links.ts: hot topics' links.story, related stories' links.api). */
-  storyOrigin?: () => string | null;
   /** More keys a feedback sender is known by; a ban under any of them holds (operations/feedback.ts). */
   feedbackKeys?: (ip: string) => string[];
 }
@@ -297,11 +249,6 @@ export function installModules(modules: readonly ServerModule[]): void {
 
 export function serverModules(): readonly ServerModule[] {
   return installed;
-}
-
-/** The first installed module's responder, if any. */
-export function responder(): Responder | null {
-  return installed.find((m) => m.responder)?.responder ?? null;
 }
 
 /** The first installed module's reminder for the person behind this request, at this exit. */

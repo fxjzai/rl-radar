@@ -2,22 +2,26 @@
 // duplicate checks, pause/resume and manual collection. Every change is audited.
 import { z } from "zod";
 import { SOURCE_DEFAULTS } from "@aihot/site";
+import { SELECTION } from "@aihot/industry/selection";
 import type { AdminSource, AdminSourceCreated, AdminSourceDetail, AdminSourcePreview, AdminSourceRow, AdminSources, BeforeJson } from "@aihot/contracts/admin";
 import { REPLACEABLE_SOURCE_KINDS } from "@aihot/contracts/admin";
 import { audit, auditHistory, Conflict } from "../audit.ts";
 import { groupingReset } from "../content/provenance.ts";
 import { sql, type Db } from "../db.ts";
 import { enqueue, QUEUES } from "../jobs/queue.ts";
-import { republishKey } from "../jobs/publication.ts";
+import { republishKey, requestRepublish } from "../jobs/publication.ts";
 import { normalizeUrl } from "../lib/url.ts";
 import { serverModules } from "../modules.ts";
 import { fetchJsonList } from "../sources/json-list.ts";
 import { fetchRss } from "../sources/rss.ts";
 import { assertSupportedConfig, UnsupportedConfig } from "../sources/config-keys.ts";
-import { admitListing, filterPublicationWindow } from "../sources/filters.ts";
-import type { SourceRow } from "../sources/types.ts";
-import { fetchDetail, fetchWebList } from "../sources/web-list.ts";
+import { applyUsePace, enrichDetails, listingEntries, storedDetails } from "../sources/collect.ts";
+import { filterPublicationWindow } from "../sources/filters.ts";
+import { FetchError, type Candidate, type SourceRow } from "../sources/types.ts";
+import { fetchWebList } from "../sources/web-list.ts";
 import { fetchXSearch } from "../sources/x.ts";
+import { xHandle } from "../sources/account.ts";
+import { SourceUses, useLabels } from "../sources/uses.ts";
 
 
 export interface SourceListFilters {
@@ -26,6 +30,8 @@ export interface SourceListFilters {
   health?: string;
   enabled?: "true" | "false";
   mode?: string;
+  /** A use of sources a module declares (sources/uses.ts). */
+  use?: string;
   page?: number;
 }
 
@@ -34,7 +40,7 @@ export async function listSources(f: SourceListFilters): Promise<BeforeJson<Admi
   const q = f.q?.trim() ? `%${f.q.trim()}%` : null;
   const [rows, [totals]] = await Promise.all([
     sql<BeforeJson<AdminSourceRow>[]>`
-    SELECT s.id, s.name, s.kind, s.tier, s.participation_mode, s.enabled, s.health, s.fail_count, s.interval_minutes,
+    SELECT s.id, s.name, s.kind, s.tier, s.selection_class, s.participation_mode, s.uses, s.enabled, s.health, s.fail_count, s.interval_minutes,
            s.last_ok_at, s.last_fetch_at, s.last_error, (s.tier = 'T1') AS first_party, s.next_fetch_at,
            (SELECT count(*)::int FROM articles a WHERE a.source_id = s.id AND a.discovered_at > now() - interval '7 days') AS items_7d,
            (SELECT count(*)::int FROM publications p WHERE p.source_id = s.id AND p.selected AND p.discovered_at > now() - interval '30 days') AS selected_30d
@@ -44,6 +50,7 @@ export async function listSources(f: SourceListFilters): Promise<BeforeJson<Admi
         AND (${f.kind ?? null}::text IS NULL OR kind = ${f.kind ?? null})
         AND (${f.health ?? null}::text IS NULL OR health = ${f.health ?? null})
         AND (${f.mode ?? null}::text IS NULL OR participation_mode = ${f.mode ?? null})
+        AND (${f.use ?? null}::text IS NULL OR ${f.use ?? null} = ANY(uses))
         AND (${f.enabled ?? null}::text IS NULL OR enabled = (${f.enabled ?? null} = 'true'))
       ORDER BY enabled DESC, CASE health WHEN 'failing' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END, name, id
       LIMIT 100 OFFSET ${(page - 1) * 100}
@@ -54,7 +61,7 @@ export async function listSources(f: SourceListFilters): Promise<BeforeJson<Admi
            count(*) FILTER (WHERE health = 'failing')::int AS failing, count(*) FILTER (WHERE health = 'degraded')::int AS degraded
     FROM sources`,
   ]);
-  return { page, rows, totals };
+  return { page, rows, totals, useLabels: useLabels() };
 }
 
 export async function sourceDetail(id: string): Promise<BeforeJson<AdminSourceDetail> | null> {
@@ -72,7 +79,7 @@ export async function sourceDetail(id: string): Promise<BeforeJson<AdminSourceDe
     auditHistory(`source:${id}`),
     sql<{ value: Record<string, unknown> }[]>`SELECT value FROM settings WHERE key = ${republishKey(id)}`,
   ]);
-  return { source, runs, items, stats: stats!, history, republish: republish?.value ?? null };
+  return { source, runs, items, stats: stats!, history, republish: republish?.value ?? null, useLabels: useLabels() };
 }
 
 /** A stored source fetched now without storing anything; null when there is no such source. */
@@ -84,36 +91,33 @@ export async function previewStoredSource(id: string): Promise<BeforeJson<AdminS
 export async function previewSource(draft: Pick<SourceRow, "id" | "kind" | "config"> & Partial<SourceRow>): Promise<BeforeJson<AdminSourcePreview>> {
   const source = { name: draft.id, enabled: true, cursor: null, tier: "T2", participation_mode: "editorial", ...draft } as SourceRow;
   assertSupportedConfig(source.kind, source.config);
-  const started = Date.now();
-  let candidates;
-  if (source.kind === "rss") candidates = (await fetchRss(source, { force: true })).candidates;
-  else if (source.kind === "web_list") candidates = await fetchWebList(source);
-  else if (source.kind === "json_list") candidates = await fetchJsonList(source);
-  else if (source.kind === "x_search") candidates = (await fetchXSearch(source)).candidates;
+  const started = performance.now();
+  let found;
+  if (source.kind === "rss") found = (await fetchRss(source, { force: true })).candidates;
+  else if (source.kind === "web_list") found = await fetchWebList(source);
+  else if (source.kind === "json_list") found = await fetchJsonList(source);
+  else if (source.kind === "x_search") found = (await fetchXSearch(source)).candidates;
   else throw new Error(`preview is not available for ${source.kind} sources`);
-  candidates = admitListing(candidates, source);
-  // A publication boundary depends on the article's date, including when only its detail page has
-  // one. The same bounded detail rules as collection apply; a failed/missing date stays inadmissible.
-  const detail = source.config.detail;
-  if (source.config.publishedAfter && detail) {
-    let reads = 0;
-    for (const candidate of candidates) {
-      if (detail.publishedAtAuthoritative === true) candidate.publishedAt = null;
-      if (candidate.publishedAt || reads >= Number(detail.maxFetches ?? 0)) continue;
-      reads += 1;
-      try {
-        const got = await fetchDetail(candidate.url, source, { date: true, title: false, summary: false });
-        candidate.publishedAt = got.publishedAt;
-      } catch { /* An inaccessible detail cannot establish admission to the publication window. */ }
-    }
+  // The listing and its detail pages as collection reads them, within the fixed publication boundary;
+  // the limits of a first import and of later runs depend on the source's runs and are not previewed.
+  let candidates = await listingEntries(source, found);
+  const known = await storedDetails(candidates.map((c) => c.identityKey!));
+  const admits = (c: Candidate) => filterPublicationWindow([c], source.config.publishedAfter).length > 0;
+  const reads = await enrichDetails(candidates, source, known, { budget: Number(source.config.detail?.maxFetches ?? 0), datedOut: {}, retries: {}, admits });
+  // A page that fails keeps its listing data, as in collection; when none can be read, the rules are what fails.
+  if (reads.failures.length && reads.failures.length === reads.attempts) {
+    throw new FetchError(`原文页全部读取失败（${reads.failures.length} 页）：${reads.failures.map((f) => `${f.url}（${f.error}）`).join("；")}`);
   }
-  candidates = filterPublicationWindow(candidates, source.config.publishedAfter);
+  candidates = candidates.filter(admits);
   return {
-    ms: Date.now() - started,
+    ms: Math.round(performance.now() - started),
     count: candidates.length,
     items: candidates.slice(0, 20).map((c) => ({ title: c.title, url: c.url, publishedAt: c.publishedAt?.toISOString() ?? null, excerpt: (c.excerpt ?? c.bodyText ?? "").slice(0, 200) })),
   };
 }
+
+/** A class of the industry pack (industry/selection.ts), or none. */
+const SelectionClass = z.string().refine((c) => Object.hasOwn(SELECTION.classes, c), { message: "不是行业包里的信源类别" }).nullable();
 
 const EDITABLE = z
   .object({
@@ -122,6 +126,7 @@ const EDITABLE = z
     enabled: z.boolean(),
     interval_minutes: z.number().int().min(1).max(1440),
     tier: z.enum(["T1", "T1_5", "T2", "EXCLUDE_MP"]),
+    selection_class: SelectionClass,
     participation_mode: z.enum(["editorial", "hot_signal", "isolated"]),
     signal_group_id: z.string().max(120).nullable(),
     first_party: z.boolean(),
@@ -129,6 +134,7 @@ const EDITABLE = z
     site_fulltext: z.boolean(),
     syndicate_fulltext: z.boolean(),
     tags: z.array(z.string().max(60)).max(30),
+    uses: SourceUses,
     config: z.record(z.string(), z.unknown()),
   })
   .partial()
@@ -139,6 +145,14 @@ const kindHooks = (kind: string) => serverModules().flatMap((m) => m.sourceKinds
 
 export async function updateSource(id: string, input: { patch: unknown; version: string; reason?: string }, actor: string) {
   const patch = EDITABLE.parse(input.patch);
+  const after = await saveSource(id, patch, input, actor);
+  if (!after || !patch.uses) return after;
+  // New uses may ask for a faster pace: from now, not from the next daily adaptation.
+  await applyUsePace(id);
+  return (await sql`SELECT * FROM sources WHERE id = ${id}`)[0];
+}
+
+async function saveSource(id: string, patch: z.infer<typeof EDITABLE>, input: { version: string; reason?: string }, actor: string) {
   return sql.begin(async (tx) => {
     // Creation and address edits share the lock: checking then inserting must not race.
     if (patch.config) await tx`SELECT pg_advisory_xact_lock(hashtext('admin-source-identity'))`;
@@ -197,9 +211,7 @@ export async function updateSource(id: string, input: { patch: unknown; version:
     // all (in the worker) so a revoked licence or an isolated source stops on every exit.
     const publisherChanged = patch.config && ["publisherRole", "publisherUrlPrefixes", "publisherRequiresDiscovery"].some(k => JSON.stringify((before.config as Record<string, unknown>)[k]) !== JSON.stringify(patch.config![k]));
     if (publisherChanged || keys.some((k) => PUBLICATION_FIELDS.includes(k) && JSON.stringify(before[k]) !== JSON.stringify(patch[k]))) {
-      await tx`INSERT INTO settings (key, value, updated_by) VALUES (${republishKey(id)}, ${tx.json({ status: "queued", queuedAt: new Date().toISOString() })}, ${actor})
-               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`;
-      await enqueue(QUEUES.republishSource, { sourceId: id }, { singletonKey: id }, tx);
+      await requestRepublish(tx, id, actor);
     }
     return after;
   });
@@ -225,10 +237,12 @@ const CreateSchema = z
     kind: z.enum(["rss", "web_list", "json_list", "x_search", "mp_account", "external"]),
     config: z.record(z.string(), z.unknown()),
     tier: z.enum(["T1", "T1_5", "T2", "EXCLUDE_MP"]).default("T2"),
+    selection_class: SelectionClass.default(null),
     participation_mode: z.enum(["editorial", "hot_signal", "isolated"]).default("editorial"),
     interval_minutes: z.number().int().min(1).max(1440).default(30),
     first_party: z.boolean().default(false),
     tags: z.array(z.string()).default([]),
+    uses: SourceUses.default([]),
     site_fulltext: z.boolean().default(SOURCE_DEFAULTS.siteFulltext),
     syndicate_fulltext: z.boolean().default(false),
   })
@@ -238,8 +252,8 @@ const CreateSchema = z
 export function sourceIdentity(kind: string, config: Record<string, unknown>): string | null {
   const raw = (config.feedUrl ?? config.url ?? config.listUrl ?? config.endpoint ?? null) as string | null;
   if (kind === "x_search") {
-    const m = /from:([A-Za-z0-9_]{1,15})/.exec(String(config.query ?? ""));
-    return m ? `x:${m[1]!.toLowerCase()}` : null;
+    const handle = xHandle(config);
+    return handle ? `x:${handle.toLowerCase()}` : null;
   }
   // A WeChat account is one account whichever id names it.
   if (kind === "mp_account") {
@@ -259,21 +273,28 @@ export async function findDuplicateSource(kind: string, config: Record<string, u
 
 export async function createSource(input: unknown, actor: string): Promise<BeforeJson<AdminSourceCreated>> {
   const s = CreateSchema.parse(input);
+  // First party is tier T1 only: an official account, staff member, original reporting or a link to the
+  // official site does not make a T1_5 or T2 source first party (being a representative is decided separately).
   s.first_party = s.tier === "T1";
   assertSupportedConfig(s.kind, s.config);
-  return sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtext('admin-source-identity'))`;
     const dup = await findDuplicateSource(s.kind, s.config, undefined, tx);
     if (dup) return { created: false as const, duplicate: dup };
     const [row] = await tx<BeforeJson<AdminSource>[]>`
-    INSERT INTO sources (id, name, kind, config, tier, participation_mode, interval_minutes, first_party, tags, site_fulltext, syndicate_fulltext, next_fetch_at)
-    VALUES (${s.id}, ${s.name}, ${s.kind}, ${tx.json(s.config as never)}, ${s.tier}, ${s.participation_mode}, ${s.interval_minutes}, ${s.first_party}, ${s.tags},
+    INSERT INTO sources (id, name, kind, config, tier, selection_class, participation_mode, uses, interval_minutes, first_party, tags, site_fulltext, syndicate_fulltext, next_fetch_at)
+    VALUES (${s.id}, ${s.name}, ${s.kind}, ${tx.json(s.config as never)}, ${s.tier}, ${s.selection_class}, ${s.participation_mode}, ${s.uses}, ${s.interval_minutes}, ${s.first_party}, ${s.tags},
             ${s.site_fulltext}, ${s.syndicate_fulltext}, now())
     ON CONFLICT (id) DO NOTHING RETURNING *`;
     if (!row) throw new Conflict(`信源 ID ${s.id} 已存在`);
     await audit(actor, "source.create", `source:${s.id}`, null, null, s, { db: tx });
     return { created: true as const, source: row };
   });
+  if (!result.created || !s.uses.length) return result;
+  // Its uses may ask for a faster pace than the one it was created with.
+  await applyUsePace(s.id);
+  const [source] = await sql<BeforeJson<AdminSource>[]>`SELECT * FROM sources WHERE id = ${s.id}`;
+  return { created: true as const, source: source! };
 }
 
 export async function fetchNow(id: string, actor: string) {

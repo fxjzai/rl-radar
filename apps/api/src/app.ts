@@ -2,6 +2,7 @@ import Fastify, { LogController, type FastifyInstance, type FastifyReply, type F
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import { OAUTH_PROBE_PATHS, resolveRedirect } from "@aihot/contracts/http-policy";
+import { ADMIN } from "@aihot/site";
 import { sql } from "@aihot/backend/db";
 import { logError } from "@aihot/backend/lib/log-error";
 import { serverModules } from "@aihot/backend/modules";
@@ -84,15 +85,16 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   app.get("/api/health", async (_req, reply) => {
-    const started = Date.now();
+    const started = performance.now();
     await sql`SELECT 1`;
-    return reply.header("Cache-Control", "no-store").send({ ok: true, db: "ok", ms: Date.now() - started, release: process.env.AIHOT_RELEASE ?? "dev" });
+    return reply.header("Cache-Control", "no-store").send({ ok: true, db: "ok", ms: Math.round(performance.now() - started), release: process.env.AIHOT_RELEASE ?? "dev" });
   });
 
   registerSite(app);
   registerOg(app);
   registerAdminAuth(app);
-  registerAdmin(app);
+  // The admin pages' API, on a site that has the pages; signing in serves every site.
+  if (ADMIN) registerAdmin(app);
   registerIngest(app);
   registerV1(app);
   registerAgent(app);

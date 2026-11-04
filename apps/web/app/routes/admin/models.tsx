@@ -7,7 +7,6 @@ import { adminGet } from "../../lib/admin.server";
 import { useAdminAction } from "../../features/admin/action";
 import { bj, money, num } from "../../features/admin/format";
 import { AdminPage, Badge, Button, Card, DataTable, Empty, Field, FilterChips, ReasonDialog, Select } from "../../features/admin/ui";
-import { webModules } from "../../site-modules";
 
 
 
@@ -20,10 +19,8 @@ export const meta: Route.MetaFunction = () => [{ title: `模型与评测 · ${SI
 
 const SOURCE_LABEL = { admin: "后台切换", env: "环境变量", default: "代码默认" } as const;
 
-/** A cost the provider did not report and no price covers: a link to the prices when a module keeps them. */
+/** A cost the provider did not report and no price covers. */
 function Unpriced() {
-  const prices = webModules().find((m) => m.admin?.prices)?.admin?.prices;
-  if (prices) return <Link to={prices} className="whitespace-nowrap text-ink-4 hover:text-accent">未定价</Link>;
   return <span className="whitespace-nowrap text-ink-4" title="服务商没有返回费用，按 token 数和你的模型单价自己估算">未定价</span>;
 }
 const secs = (ms: number | null) => (ms == null ? "—" : ms >= 10_000 ? `${Math.round(ms / 1000)} s` : `${(ms / 1000).toFixed(1)} s`);
@@ -52,6 +49,13 @@ export default function ModelsAdmin({ loaderData: m }: Route.ComponentProps) {
                   {c.label}
                   <span className="font-mono text-[12px] font-normal text-ink-3 [overflow-wrap:anywhere]">{c.current.model}</span>
                   <Badge tone={c.current.source === "admin" ? "accent" : "muted"}>{SOURCE_LABEL[c.current.source]}</Badge>
+                  {c.current.invalid && <Badge tone="bad">配置的 {c.current.invalid} 不存在，未生效</Badge>}
+                  {c.fallback && <span className="text-xs font-normal text-ink-3">
+                    备用 {c.fallback.model} · {c.fallback.primaryPaused
+                      ? c.fallback.backupPaused ? "主备均暂停，等待恢复" : "正在接续"
+                      : c.fallback.backupPaused ? "暂不可用" : "就绪"}
+                    {c.fallback.nextProbeAt && ` · ${bj(c.fallback.nextProbeAt)} 后随新请求复查主模型`}
+                  </span>}
                 </span>
               }
               right={

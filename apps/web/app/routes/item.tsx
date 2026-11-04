@@ -1,17 +1,19 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Await, isRouteErrorResponse, Link, useAsyncError, useLoaderData, useNavigate, useRevalidator, type ClientLoaderFunctionArgs } from "react-router";
 import type { Route } from "./+types/item";
-import type { FeedItemSummary, SiteItemDetail } from "@aihot/contracts/site";
+import type { FeedItemSummary, SiteItemDetail, StoryFollowupsResponse } from "@aihot/contracts/site";
 import { ITEM_COPY, SITE } from "@aihot/site";
 import { cachedPage, loadOr404 } from "../lib/api.server";
+import { loadFollowups } from "../features/item/followups.server";
 import { pageReuse } from "../lib/page-reuse";
 import { articleLd, breadcrumbLd, pageMeta, siteUrl, titled } from "../lib/seo";
 import { fullDateTime, relativeTime } from "../lib/format";
 import { markRead } from "../lib/local-state";
+import { copyText } from "../lib/clipboard";
 import { SameEventBadge, SelectedBadge } from "../components/ui/Badge";
 import { ScoreLabel, shownScore } from "../components/ui/Score";
 import { PillTabs } from "../components/ui/Tabs";
-import { ArticleLayout, RailSection } from "../components/ui/Page";
+import { ArticleLayout, RailSection, useContainedScroll } from "../components/ui/Page";
 import { Menu, MenuItem } from "../components/ui/Menu";
 import { StarButton } from "../features/feed/parts";
 import { GroupButton, GroupSources } from "../features/feed/ReadingGroup";
@@ -20,9 +22,10 @@ import { MediaGallery } from "../features/item/MediaGallery";
 import { QuotedPost } from "../features/item/QuotedPost";
 import { ArticleBody } from "../features/item/ArticleBody";
 import { ActionsSheet, ReaderToolbar, type ActionRow } from "../features/item/ReaderTools";
-import { OutlineSheet, scrollToAnchor } from "../components/ui/OutlineSheet";
+import { OutlineSheet } from "../components/ui/OutlineSheet";
+import { scrollToAnchor } from "../lib/motion";
 import { takePreview } from "../features/item/preview";
-import { IconArrowLeft, IconCopy, IconDownload, IconExternal, IconImage, IconMenu, IconMore, IconShare } from "../components/icons";
+import { IconArrowLeft, IconCopy, IconDownload, IconExternal, IconImage, IconList, IconMenu, IconMore, IconShare } from "../components/icons";
 import { BarButton, PhoneBar } from "../components/shell/PhoneBar";
 import { isPhone, type Screen } from "../components/shell/screens";
 
@@ -33,10 +36,11 @@ const PosterSheet = lazy(() => import("../features/item/PosterSheet"));
 
 export async function loader({ params, request }: Route.LoaderArgs) {
   const item = await loadOr404<SiteItemDetail>(`/api/site/items/${encodeURIComponent(params.id)}`, { signal: request.signal });
-  return cachedPage(600, { item });
+  return cachedPage(600, { item, followups: await loadFollowups(item, request.signal) });
 }
 
-type Preview = { item: null; preview: FeedItemSummary; detail: Promise<{ item: SiteItemDetail }> };
+type Loaded = { item: SiteItemDetail; followups: StoryFollowupsResponse | null };
+type Preview = { item: null; preview: FeedItemSummary; detail: Promise<Loaded> };
 
 /**
  * Phones: an article tapped in a list opens at once with what the card showed (title, summary, reason),
@@ -107,52 +111,23 @@ function jumpTo(e: React.MouseEvent, id: string) {
   scrollToAnchor(id);
 }
 
+/**
+ * The outline takes what is left of its rail and scrolls within it; with room for fewer than six entries it
+ * keeps six (an entry is its 12.5px line at leading-snug plus 8px of padding), and the rail scrolls instead.
+ */
 function ArticleOutline({ outline }: { outline: SiteItemDetail["outline"] }) {
-  const ref = useRef<HTMLElement>(null);
-  const [scrollable, setScrollable] = useState(false);
-  useEffect(() => {
-    const nav = ref.current!;
-    const list = nav.firstElementChild!;
-    const rail = nav.closest("aside")!.firstElementChild!;
-    let frame = 0;
-    const update = () => {
-      frame = 0;
-      if (!nav.getClientRects().length) return;
-      // Measure within the sticky rail, so scrolling the article cannot change the list's height.
-      const inset = parseFloat(getComputedStyle(rail).top);
-      const offset = nav.getBoundingClientRect().top - rail.getBoundingClientRect().top;
-      const available = window.innerHeight - inset * 2 - offset;
-      // A scrollbar can wrap the first entry. Use one line as the minimum to avoid toggling it.
-      const entryStyle = getComputedStyle(list.firstElementChild!.firstElementChild!);
-      const minimumHeight = parseFloat(entryStyle.lineHeight) + parseFloat(entryStyle.paddingTop) + parseFloat(entryStyle.paddingBottom);
-      nav.style.maxHeight = available >= minimumHeight ? `${available}px` : "";
-      setScrollable(nav.scrollHeight > nav.clientHeight);
-    };
-    const schedule = () => {
-      if (!frame) frame = requestAnimationFrame(update);
-    };
-    const resize = new ResizeObserver(schedule);
-    resize.observe(rail);
-    resize.observe(list);
-    window.addEventListener("resize", schedule);
-    update();
-    return () => {
-      cancelAnimationFrame(frame);
-      resize.disconnect();
-      window.removeEventListener("resize", schedule);
-    };
-  }, []);
+  const [nav, overscroll] = useContainedScroll<HTMLElement>();
   const containKeys = (e: React.KeyboardEvent<HTMLElement>) => {
-    if (!scrollable || e.altKey || e.ctrlKey || e.metaKey) return;
     const nav = e.currentTarget;
+    if (nav.scrollHeight <= nav.clientHeight || e.altKey || e.ctrlKey || e.metaKey) return;
     const up = ["ArrowUp", "PageUp", "Home"].includes(e.key) || (e.key === " " && e.shiftKey);
     const down = ["ArrowDown", "PageDown", "End"].includes(e.key) || (e.key === " " && !e.shiftKey);
     // WebKit can chain keyboard scrolling even with overscroll-behavior: contain.
     if ((up && nav.scrollTop <= 0) || (down && nav.scrollTop + nav.clientHeight >= nav.scrollHeight - 1)) e.preventDefault();
   };
   return (
-    <RailSection title="本文目录">
-      <nav ref={ref} aria-label="本文目录" tabIndex={scrollable ? 0 : undefined} onKeyDown={containKeys} className={`article-outline scrollbar-thin overflow-y-auto${scrollable ? " overscroll-y-contain" : ""}`}>
+    <RailSection title="本文目录" shrink>
+      <nav ref={nav} aria-label="本文目录" tabIndex={overscroll ? 0 : undefined} onKeyDown={containKeys} className={`scrollbar-thin min-h-[calc(6*(12.5px*1.375+8px))] overflow-y-auto ${overscroll}`}>
         <ol className="space-y-0.5 border-l border-line">
           {outline.map((o) => (
             <li key={o.id}>
@@ -187,7 +162,7 @@ async function shareOrCopy(item: Pick<SiteItemDetail, "id" | "title">): Promise<
       await navigator.share({ title: item.title, url });
       return "shared";
     }
-    await navigator.clipboard.writeText(`${item.title}\n${url}`);
+    await copyText(`${item.title}\n${url}`);
     return "copied";
   } catch {
     return null;
@@ -215,12 +190,12 @@ function Toast({ text }: { text: string | null }) {
 }
 
 export default function ItemPage() {
-  const data = useLoaderData<typeof clientLoader>() as { item: SiteItemDetail } | Preview;
-  if (data.item) return <ItemView key={`${data.item.id}:${data.item.bodyLanguage}`} item={data.item} />;
+  const data = useLoaderData<typeof clientLoader>() as Loaded | Preview;
+  if (data.item) return <ItemView key={`${data.item.id}:${data.item.bodyLanguage}`} item={data.item} followups={data.followups} />;
   return (
     <Suspense fallback={<ItemPreview preview={data.preview} />}>
       <Await resolve={data.detail} errorElement={<ItemGone />}>
-        {(loaded) => <ItemView key={`${loaded.item.id}:${loaded.item.bodyLanguage}`} item={loaded.item} />}
+        {(loaded) => <ItemView key={`${loaded.item.id}:${loaded.item.bodyLanguage}`} item={loaded.item} followups={loaded.followups} />}
       </Await>
     </Suspense>
   );
@@ -289,8 +264,8 @@ function ItemGone() {
     <div className="mx-auto max-w-sm pb-8">
       <PhoneBar back={{ to: "/", label: "精选" }} />
       <div className="py-24 text-center">
-        <div className="text-[20px] font-bold text-ink">{gone ? "这里没有内容" : "暂时无法加载"}</div>
-        <p className="mt-2 text-[13.5px] leading-relaxed text-ink-3">{gone ? "这篇内容不存在，或已不再公开。" : "服务暂时繁忙，请稍后再试。"}</p>
+        <div className="text-[20px] font-bold text-ink">{gone ? "找不到这篇内容" : "暂时无法加载"}</div>
+        <p className="mt-2 text-[13.5px] leading-relaxed text-ink-3">{gone ? "链接可能有误，或者这篇内容已经下架。" : "服务暂时繁忙，请稍后再试。"}</p>
         {!gone && (
           <button type="button" onClick={() => void revalidator.revalidate()} className="mt-6 h-11 rounded-full border border-line-strong bg-surface px-5 text-[14px] font-medium text-ink-2 active:bg-bg-sunk">
             重试
@@ -301,7 +276,7 @@ function ItemGone() {
   );
 }
 
-function ItemView({ item }: { item: SiteItemDetail }) {
+function ItemView({ item, followups }: Loaded) {
   const navigate = useNavigate();
   const hasTranslation = item.hasTranslation;
   const lang = item.bodyLanguage;
@@ -322,7 +297,7 @@ function ItemView({ item }: { item: SiteItemDetail }) {
   };
   const copyLink = async () => {
     try {
-      await navigator.clipboard.writeText(`${siteUrl()}/items/${item.id}`);
+      await copyText(`${siteUrl()}/items/${item.id}`);
       setToast("链接已复制");
     } catch {
       // clipboard unavailable
@@ -332,7 +307,7 @@ function ItemView({ item }: { item: SiteItemDetail }) {
     try {
       const res = await fetch(`/items/${item.id}/markdown`);
       if (!res.ok) throw new Error(String(res.status));
-      await navigator.clipboard.writeText(await res.text());
+      await copyText(await res.text());
       setToast("Markdown 已复制");
     } catch {
       setToast("复制失败，请在浏览器中打开后导出");
@@ -340,7 +315,7 @@ function ItemView({ item }: { item: SiteItemDetail }) {
   };
 
   const bodyHtml = lang === "zh" ? (item.body?.zh ?? item.body?.original) : (item.body?.original ?? item.body?.zh);
-  const bodyLabel = !item.body ? null : lang === "zh" && item.body.zhKind === "translation" ? "正文 · AI 翻译" : lang === "original" && hasTranslation ? "正文 · 原文" : "正文";
+  const bodyLabel = !item.body ? null : lang === "zh" && item.body.zhKind === "translation" ? "正文 · AI 翻译" : lang === "original" ? "正文 · 原文" : "正文";
   const isX = item.channel === "x" && !!item.x;
   // Without a reliable date from the original, the time shown is when it was collected, labelled as such.
   const shownAt = item.publishedAt ?? item.discoveredAt;
@@ -355,8 +330,9 @@ function ItemView({ item }: { item: SiteItemDetail }) {
     if (window.history.state?.idx > 0) navigate(-1);
     else navigate(item.selected ? "/" : "/all");
   };
+  // In the left rail (a flex column) it keeps its own height and width.
   const backButton = (
-    <button type="button" onClick={back} className="-ml-1.5 inline-flex h-8 items-center gap-1.5 rounded-full px-1.5 text-[13px] text-ink-3 transition-colors hover:text-ink">
+    <button type="button" onClick={back} className="-ml-1.5 inline-flex h-8 shrink-0 items-center gap-1.5 self-start rounded-full px-1.5 text-[13px] text-ink-3 transition-colors hover:text-ink touch:h-11">
       <IconArrowLeft size={16} /> 返回
     </button>
   );
@@ -389,18 +365,21 @@ function ItemView({ item }: { item: SiteItemDetail }) {
         : { key: "markdown", label: "导出 Markdown", icon: <IconDownload size={20} />, href: `/items/${item.id}/markdown`, download: true }]
       : []),
   ];
+  const originalLink = (className: string) => (
+    <a
+      href={item.links.original}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={`inline-flex h-8 items-center justify-center gap-1.5 rounded-full border border-line-strong bg-surface px-3.5 text-[12.5px] font-medium text-ink-2 transition-colors hover:border-ink-4 hover:text-ink ${className}`}
+    >
+      {originalLabel} <IconExternal size={13} />
+    </a>
+  );
   // Desktop actions head the right rail, one row as tall as 返回 at the head of the left one.
   const actions = (
     <div className="flex items-center gap-1">
-      <a
-        href={item.links.original}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-full border border-line-strong bg-surface px-3.5 text-[12.5px] font-medium text-ink-2 transition-colors hover:border-ink-4 hover:text-ink"
-      >
-        {originalLabel} <IconExternal size={13} />
-      </a>
-      <StarButton item={item} size={32} />
+      {originalLink("flex-1 touch:h-11")}
+      <StarButton item={item} className="size-8 touch:size-11" />
       {moreMenu}
     </div>
   );
@@ -492,12 +471,25 @@ function ItemView({ item }: { item: SiteItemDetail }) {
           <>
             {actions}
             {notes}
-            <div className="space-y-8 2xl:hidden">{outline}</div>
+            <div className="flex min-h-0 flex-col space-y-8 2xl:hidden">{outline}</div>
           </>
         }
       >
-        {/* Between lg and 2xl the left rail is hidden: 返回 stays at the top while reading, as on the original site. */}
-        <div className="sticky top-0 z-20 -mx-2 hidden bg-bg/95 px-2 py-1.5 backdrop-blur lg:block 2xl:hidden">{backButton}</div>
+        {/* Between lg and 2xl the left rail is hidden: 返回 stays at the top while reading, as on the original site.
+            Below side the right rail is hidden too, and its actions and the outline join 返回. */}
+        <div className="sticky top-0 z-20 -mx-2 hidden items-center justify-between gap-3 bg-bg/95 px-2 py-1.5 backdrop-blur lg:flex 2xl:hidden">
+          {backButton}
+          <div className="flex items-center gap-1 side:hidden">
+            {showOutline && (
+              <button type="button" onClick={() => setOutlineOpen(true)} className="inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-[12.5px] font-medium text-ink-3 transition-colors hover:bg-bg-sunk hover:text-ink touch:h-11">
+                <IconList size={15} /> 目录
+              </button>
+            )}
+            {originalLink("touch:h-11")}
+            <StarButton item={item} className="size-8 touch:size-11" />
+            {moreMenu}
+          </div>
+        </div>
         <article className="pb-6 pt-3 lg:pt-2 2xl:pt-1">
           <div className={`flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[13px] text-ink-3 2xl:hidden ${isX ? "" : "mb-3"}`}>
             <span className="font-semibold text-ink-2">{isX ? item.x!.authorName : item.source.name}</span>
@@ -508,12 +500,12 @@ function ItemView({ item }: { item: SiteItemDetail }) {
             <time dateTime={shownAt} className="mono">{fullDateTime(shownAt)}</time>
             <span suppressHydrationWarning>· {relativeTime(shownAt)}</span>
             {item.selected && (
-              <span className="ml-1 lg:hidden">
+              <span className="ml-1 side:hidden">
                 {item.sameEvent ? <SameEventBadge /> : <SelectedBadge />}
               </span>
             )}
             {shownScore(item.score) !== null && (
-              <span className="ml-1 lg:hidden">
+              <span className="ml-1 side:hidden">
                 <ScoreLabel score={item.score} />
               </span>
             )}
@@ -529,7 +521,7 @@ function ItemView({ item }: { item: SiteItemDetail }) {
           )}
 
           {item.reason && !summaryOnly && (
-            <section className="mt-6 border-t border-line pt-4 lg:hidden">
+            <section className="mt-6 border-t border-line pt-4 side:hidden">
               <div className="mb-1 text-[12px] font-semibold text-ink-3">{ITEM_COPY.reasonLabel}</div>
               <p className="text-[15px] leading-[1.75] text-ink-2">{item.reason}</p>
             </section>
@@ -537,7 +529,7 @@ function ItemView({ item }: { item: SiteItemDetail }) {
 
           {item.sameEvent && (
             <p className="mt-5 text-[13px] leading-relaxed text-ink-4">
-              同一新闻，精选展示
+              同一件事，精选收录的是
               <Link viewTransition to={`/items/${item.sameEvent.id}`} className="text-ink-3 transition-colors hover:text-accent">
                 《{item.sameEvent.title}》
               </Link>
@@ -564,8 +556,8 @@ function ItemView({ item }: { item: SiteItemDetail }) {
                     label="正文语言"
                     active={lang}
                     items={[
-                      { key: "zh", label: "中文", prefetch: "intent", replace: true, to: `/items/${item.id}` },
-                      { key: "original", label: "原文", prefetch: "intent", replace: true, to: `/items/${item.id}/original` },
+                      { key: "zh", label: "中文", prefetchOnPress: true, replace: true, to: `/items/${item.id}` },
+                      { key: "original", label: "原文", prefetchOnPress: true, replace: true, to: `/items/${item.id}/original` },
                     ]}
                   />
                 )}
@@ -589,7 +581,7 @@ function ItemView({ item }: { item: SiteItemDetail }) {
           </p>
 
           {(item.topics.length > 0 || item.tags.length > 0) && (
-            <div className="mt-4 flex flex-wrap gap-1.5 lg:hidden">
+            <div className="mt-4 flex flex-wrap gap-1.5 side:hidden">
               {item.topics.map((t) => (
                 <Link viewTransition key={t.slug} to={`/topics/${t.slug}`} className="chip">
                   {t.name}
@@ -603,7 +595,7 @@ function ItemView({ item }: { item: SiteItemDetail }) {
             </div>
           )}
 
-          {item.story && <StoryFollowups story={item.story} currentId={item.id} />}
+          {item.story && <StoryFollowups followups={followups} story={item.story} currentId={item.id} />}
 
           {related.length > 0 && (
             <section className="mt-8">

@@ -1,13 +1,14 @@
 // Database and file backups: a verified custom-format dump plus the uploaded files, sent
 // to the existing object store (Tencent COS through its S3-compatible API, AWS Signature V4) under
-// daily/ (Sundays also weekly/, the 1st also monthly/). A few local copies are kept.
+// one retention prefix: monthly/ on the 1st, otherwise weekly/ on Sundays or daily/.
 import { execFile } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { config, credential } from "../config.ts";
+import { beijingDate, beijingWeekday } from "@aihot/contracts/time";
+import { config } from "../config.ts";
 import { sql } from "../db.ts";
 import { screenshotsForwarded } from "./feedback.ts";
 
@@ -27,14 +28,14 @@ export function backupConfigured(): boolean {
   return store() !== null;
 }
 
+/** The object store, from the environment (backend.env); named one by one so the template check sees them. */
 function store(): Store | null {
-  const get = (k: string) => process.env[k] || credential("integrations", k) || null;
-  const secretId = get("DB_BACKUP_STORE_SECRET_ID");
-  const secretKey = get("DB_BACKUP_STORE_SECRET_KEY");
-  const bucket = get("DB_BACKUP_STORE_BUCKET");
-  const region = get("DB_BACKUP_STORE_REGION");
+  const secretId = process.env.DB_BACKUP_STORE_SECRET_ID;
+  const secretKey = process.env.DB_BACKUP_STORE_SECRET_KEY;
+  const bucket = process.env.DB_BACKUP_STORE_BUCKET;
+  const region = process.env.DB_BACKUP_STORE_REGION;
   if (!secretId || !secretKey || !bucket || !region) return null;
-  const domain = get("DB_BACKUP_STORE_DOMAIN");
+  const domain = process.env.DB_BACKUP_STORE_DOMAIN;
   return { secretId, secretKey, bucket, region, endpoint: domain ? `https://${domain.replace(/^https?:\/\//, "")}` : `https://${bucket}.cos.${region}.myqcloud.com` };
 }
 
@@ -82,49 +83,61 @@ export async function runBackup(now = new Date()) {
   // Named after the database ("news_db" → news-db-…), so two databases backed up into one store stay apart.
   const name = sql.options.database.toLowerCase().replace(/[^a-z0-9]+/g, "-");
   const dump = path.join(dir, `${name}-${stamp}.dump`);
-  await run("pg_dump", ["--format=custom", "--compress=6", "--no-owner", "--file", dump, config.databaseUrl], { maxBuffer: 16 * 1024 * 1024 });
+  // execFile includes argv in failures. Give libpq credentials through its environment so neither
+  // process listings nor a failed job's stored error contain them; keep other connection options.
+  const connection = new URL(config.databaseUrl);
+  const env = { ...process.env,
+    ...(connection.username ? { PGUSER: decodeURIComponent(connection.username) } : {}),
+    ...(connection.password ? { PGPASSWORD: decodeURIComponent(connection.password) } : {}),
+  };
+  connection.username = connection.password = "";
+  // libpq decodes percent escapes but not form-style '+'. Keep non-credential options byte-for-byte.
+  connection.search = connection.search.slice(1).split("&").filter(option => {
+    const separator = option.indexOf("=");
+    const key = decodeURIComponent(option.slice(0, separator));
+    if (key !== "user" && key !== "password") return true;
+    env[key === "user" ? "PGUSER" : "PGPASSWORD"] = decodeURIComponent(option.slice(separator + 1));
+    return false;
+  }).join("&");
+  await run("pg_dump", ["--format=custom", "--compress=6", "--no-owner", "--file", dump, connection.href], { env, maxBuffer: 16 * 1024 * 1024 });
   // Verify before shipping: the archive must list cleanly.
   await run("pg_restore", ["--list", dump], { maxBuffer: 64 * 1024 * 1024 });
   const files = path.join(dir, `${name}-files-${stamp}.tar.gz`);
-  // An empty archive only when there is nothing to keep. A failure to read or pack existing files is
+  // No archive when there are no attachments. A failure to read or pack existing files is
   // tried once more and otherwise reported: the database dump still ships, but the run fails.
   const kept: string[] = [];
   // Feedback screenshots only waiting to be forwarded are not kept (once forwarded, only the Feishu image
   // key remains). Without the internal chat they stay here for good, referred to as local: files.
-  for (const d of screenshotsForwarded() ? ["uploads"] : ["uploads", "feedback-screenshots"]) {
-    const info = await stat(path.join(config.dataDir, d)).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return null;
-      throw error;
-    });
-    if (!info) continue;
-    if (!info.isDirectory()) throw new Error(`backup ${d} path is not a directory`);
-    kept.push(d);
-  }
   let filesError: string | null = null;
-  if (!kept.length) await run("tar", ["-czf", files, "-T", "/dev/null"]);
-  else {
-    const pack = () => run("tar", ["-czf", files, "-C", config.dataDir, ...kept]);
-    await pack().catch(() => pack()).catch((error: unknown) => {
-      // tar's own words: the message starts with the whole command line, which can fill the excerpt.
-      const stderr = (error as { stderr?: unknown })?.stderr;
-      filesError = String(typeof stderr === "string" && stderr.trim() ? stderr.trim() : error instanceof Error ? error.message : error).slice(0, 300);
-    });
+  try {
+    for (const d of screenshotsForwarded() ? ["uploads"] : ["uploads", "feedback-screenshots"]) {
+      const info = await stat(path.join(config.dataDir, d)).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      if (!info) continue;
+      if (!info.isDirectory()) throw new Error(`backup ${d} path is not a directory`);
+      if ((await readdir(path.join(config.dataDir, d), { recursive: true, withFileTypes: true })).some(entry => !entry.isDirectory())) kept.push(d);
+    }
+    if (kept.length) {
+      const pack = () => run("tar", ["-czf", files, "-C", config.dataDir, ...kept]);
+      await pack().catch(() => pack());
+    }
+  } catch (error: unknown) {
+    // tar's own words: the message starts with the whole command line, which can fill the excerpt.
+    const stderr = (error as { stderr?: unknown })?.stderr;
+    filesError = String(typeof stderr === "string" && stderr.trim() ? stderr.trim() : error instanceof Error ? error.message : error).slice(0, 300);
   }
   const out: Array<{ key: string; bytes: number; sha256: string }> = [];
-  const bj = new Date(now.getTime() + 8 * 3600_000);
-  const prefixes = ["daily"];
-  if (bj.getUTCDay() === 0) prefixes.push("weekly");
-  if (bj.getUTCDate() === 1) prefixes.push("monthly");
-  for (const file of filesError ? [dump] : [dump, files]) {
+  const today = beijingDate(now);
+  const prefix = today.endsWith("-01") ? "monthly" : beijingWeekday(today) === "星期日" ? "weekly" : "daily";
+  for (const file of kept.length && !filesError ? [dump, files] : [dump]) {
     const size = (await stat(file)).size;
     const sha = await fileSha256(file);
-    for (const p of prefixes) {
-      // One prefix per retention class (daily/, weekly/, monthly/): a store's lifecycle rules can expire
-      // each on its own schedule.
-      const key = `${p}/${path.basename(file)}`;
-      if (s) await upload(s, key, file, sha, size);
-      out.push({ key: s ? key : `local-only:${path.basename(file)}`, bytes: size, sha256: sha });
-    }
+    // One upload per file; the chosen prefix carries its retention class.
+    const key = `${prefix}/${path.basename(file)}`;
+    if (s) await upload(s, key, file, sha, size);
+    out.push({ key: s ? key : `local-only:${path.basename(file)}`, bytes: size, sha256: sha });
   }
   // Local copies: keep the newest few of each kind.
   for (const kind of [`${name}-2`, `${name}-files-`]) {

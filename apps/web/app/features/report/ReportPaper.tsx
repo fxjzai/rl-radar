@@ -8,7 +8,7 @@
 import { IntentLink } from "../../components/ui/IntentLink";
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router";
-import type { ReportCitation, ReportDetail, ReportNavigationEntry } from "@aihot/contracts/site";
+import { REPORT_NAMES, type ReportCitation, type ReportDetail, type ReportNavigationEntry } from "@aihot/contracts/site";
 import { REPORTS, SITE, subjectAfter, withSubject } from "@aihot/site";
 import { Badge } from "../../components/ui/Badge";
 import { IconArrowLeft, IconArrowRight, IconArrowUpRight } from "../../components/icons";
@@ -18,8 +18,9 @@ import { SourceAvatar } from "../../components/ui/SourceAvatar";
 import { Halftone } from "./Halftone";
 import { Nameplate } from "./Nameplate";
 import { IssueDots } from "./IssueDots";
-import { monthDay } from "../../lib/format";
-import { EDITION, KIND_LABEL, MOTTO, dateLine, dateMark, headline, metricItems, neighbourLabel, reportPath, shortDay } from "./format";
+import { Picture } from "../../components/ui/Picture";
+import { monthDay } from "../../lib/format.ts";
+import { EDITION, MOTTO, dateLine, dateMark, headline, metricItems, neighbourLabel, reportPath, shortDay } from "./format";
 
 const pad = (n: number) => String(n).padStart(2, "0");
 const keyOf = (c: ReportCitation) => c.itemId ?? c.title;
@@ -30,7 +31,7 @@ const before = (phrase: string, noun: string) => phrase.slice(0, -noun.length);
 
 function Masthead({ report, index, quiet }: { report: ReportDetail; index: ReportNavigationEntry[]; quiet: boolean }) {
   const mark = dateMark(report.kind, report.key);
-  const label = KIND_LABEL[report.kind];
+  const label = REPORT_NAMES[report.kind];
   return (
     <header className="pt-5 lg:pt-0">
       <div className="flex items-center justify-between gap-4 text-[12px] text-ink-4">
@@ -115,7 +116,7 @@ function Related({ items, className = "" }: { items: ReportCitation[]; className
       {items.slice(0, 4).map((r) => (
         <li key={keyOf(r)} className="flex gap-2.5 text-[13.5px] leading-[1.65]">
           <span className="mt-[9px] size-1 shrink-0 rounded-full bg-ink-4" aria-hidden="true" />
-          <span className="min-w-0 [overflow-wrap:anywhere]">
+          <span className="min-w-0">
             {r.available && r.itemId ? (
               <IntentLink viewTransition to={`/items/${r.itemId}`} className="text-ink-2 transition-colors hover:text-accent">
                 {r.title}
@@ -135,7 +136,9 @@ function Related({ items, className = "" }: { items: ReportCitation[]; className
 function Coverage({ c }: { c: ReportCitation }) {
   return (
     <>
-      {!!c.otherSources && <span className="shrink-0 text-ink-4">另有 {c.otherSources} 家信源报道</span>}
+      {!!c.otherSources && (c.storyId
+        ? <IntentLink viewTransition to={`/story/${c.storyId}`} className="shrink-0 text-ink-4 transition-colors hover:text-accent">另外 {c.otherSources} 家也报道了</IntentLink>
+        : <span className="shrink-0 text-ink-4">另外 {c.otherSources} 家也报道了</span>)}
       {c.followUp && <Badge title={`${monthDay(c.followUp)}的日报报道过这件事，这里是新进展`}>跟进</Badge>}
     </>
   );
@@ -152,7 +155,7 @@ function Story({ c, dated, className = "" }: { c: ReportCitation; dated: boolean
       </div>
       {c.available ? (
         <>
-          <h3 className="mt-3 text-[19px] font-bold leading-[1.5] tracking-[-0.01em] text-ink [overflow-wrap:anywhere] [text-wrap:pretty] @[880px]:text-[20px]">
+          <h3 className="mt-3 text-[19px] font-bold leading-[1.5] tracking-[-0.01em] text-ink [text-wrap:pretty] @[880px]:text-[20px]">
             {c.itemId ? (
               <IntentLink viewTransition to={`/items/${c.itemId}`} className="transition-colors hover:text-accent">
                 {c.title}
@@ -161,7 +164,7 @@ function Story({ c, dated, className = "" }: { c: ReportCitation; dated: boolean
               c.title
             )}
           </h3>
-          {c.summary && <p className="mt-2 line-clamp-4 text-[15px] leading-[1.85] text-ink-2 [overflow-wrap:anywhere] @[560px]:text-justify">{c.summary}</p>}
+          {c.summary && <p className="mt-2 line-clamp-4 text-[15px] leading-[1.85] text-ink-2 @[560px]:text-justify">{c.summary}</p>}
           {!!c.related?.length && <Related items={c.related} className="mt-3" />}
           <div className="mt-auto pt-3">
             <Original c={c} />
@@ -244,8 +247,8 @@ function LeadPicture({ cover, onError, priority = false, className = "" }: { cov
   return (
     <figure className={className}>
       <div className="overflow-hidden well rounded-panel" style={{ aspectRatio: shown }}>
-        <img src={cover.url} srcSet={cover.srcSet}
-          sizes={priority ? "(min-width: 1700px) 780px, (min-width: 1580px) calc(100vw - 920px), (min-width: 1420px) calc(100vw - 880px), (min-width: 1024px) calc(100vw - 540px), (min-width: 640px) 608px, calc(100vw - 32px)" : "auto, (min-width: 1180px) 300px, (min-width: 640px) 608px, calc(100vw - 32px)"}
+        <Picture src={cover.url} srcSet={cover.srcSet}
+          sizes={priority ? "(min-width: 1700px) 780px, (min-width: 1580px) calc(100vw - 920px), (min-width: 1420px) calc(100vw - 880px), (min-width: 1176px) calc(100vw - 540px), (min-width: 1140px) calc(100vw - 600px), (min-width: 941px) calc(100vw - 260px), (min-width: 700px) calc(100vw - 144px), (min-width: 640px) 608px, calc(100vw - 32px)" :"auto, (min-width: 1180px) 300px, (min-width: 640px) 608px, calc(100vw - 32px)"}
           width={cover.width ?? undefined} height={cover.height ?? undefined}
           alt="" loading={priority ? "eager" : "lazy"} fetchPriority={priority ? "high" : "auto"} decoding="async" onError={onError} className="size-full object-cover" />
       </div>
@@ -377,8 +380,7 @@ function FrontPage({ report, pages, leadStory, count }: { report: ReportDetail; 
 function QuietFront({ lead }: { lead: NonNullable<ReportDetail["lead"]> }) {
   return (
     <section aria-label="头版" className="pt-10 @[880px]:pt-16">
-      <Kicker>头版</Kicker>
-      <h2 className="mt-4 text-[32px] font-black leading-[1.28] tracking-[-0.03em] text-ink [text-wrap:balance] @[520px]:text-[40px] @[1040px]:text-[48px] @[1040px]:leading-[1.22]">
+      <h2 className="text-[32px] font-black leading-[1.28] tracking-[-0.03em] text-ink [text-wrap:balance] @[520px]:text-[40px] @[1040px]:text-[48px] @[1040px]:leading-[1.22]">
         {lead.title}
       </h2>
       {lead.leadParagraph && <p className="mt-6 max-w-[46em] text-[16.5px] leading-[1.9] text-ink-2 @[880px]:mt-7 @[880px]:text-[17.5px]">{lead.leadParagraph}</p>}
@@ -404,8 +406,9 @@ export function SectionPage({ id, no, label, children }: { id: string; no?: numb
 /** Two columns with a hairline between them, once the page is wide enough (快讯). */
 const COLUMNS = "@[760px]:columns-2 @[760px]:gap-x-12 @[760px]:[column-rule:1px_solid_var(--line)]";
 
+/** Issues change through these links, never by a sideways swipe: on iOS that would fight the edge swipe back. */
 function Neighbours({ report, index }: { report: ReportDetail; index: ReportNavigationEntry[] }) {
-  const titleOf = (key: string) => index.find((e) => e.key === key)?.title ?? `${withSubject(KIND_LABEL[report.kind])} · ${key}`;
+  const titleOf = (key: string) => index.find((e) => e.key === key)?.title ?? `${withSubject(REPORT_NAMES[report.kind])} · ${key}`;
   const cell = "group flex min-w-0 flex-col py-6";
   const title = "mt-2.5 line-clamp-2 text-[16px] font-bold leading-[1.5] text-ink transition-colors group-hover:text-accent @[880px]:text-[18px]";
   return (
@@ -437,7 +440,7 @@ function Neighbours({ report, index }: { report: ReportDetail; index: ReportNavi
 function History({ report, index }: { report: ReportDetail; index: ReportNavigationEntry[] }) {
   const others = index.filter((e) => e.key !== report.key).slice(0, 12);
   if (others.length === 0) return null;
-  const label = KIND_LABEL[report.kind];
+  const label = REPORT_NAMES[report.kind];
   return (
     <section id="report-history" className="scroll-mt-[calc(var(--bar-h)+1.5rem)] pt-12">
       <Kicker>{before(subjectAfter("往期", label), label)}{label}</Kicker>
@@ -446,7 +449,7 @@ function History({ report, index }: { report: ReportDetail; index: ReportNavigat
           <li key={e.key}>
             <Link to={reportPath(report.kind, e.key)} className="group flex items-baseline gap-4 border-b border-line py-3">
               <span className="num w-[76px] shrink-0 text-[12.5px] text-ink-4">{e.key}</span>
-              <span className="min-w-0 flex-1 truncate text-[14px] text-ink-2 transition-colors group-hover:text-accent">{e.title ?? `${SITE.name} ${KIND_LABEL[report.kind]} · ${e.key}`}</span>
+              <span className="min-w-0 flex-1 truncate text-[14px] text-ink-2 transition-colors group-hover:text-accent">{e.title ?? `${SITE.name} ${REPORT_NAMES[report.kind]} · ${e.key}`}</span>
             </Link>
           </li>
         ))}
@@ -474,7 +477,7 @@ export function ReportPaper({ report, index }: { report: ReportDetail; index: Re
   // Only a daily comes out with nothing in it: a day the editors judged with nothing new (REPORTS.quiet).
   const quiet = count === 0 && report.flashes.length === 0;
   return (
-    <article className="@container">
+    <article className="@container [overflow-wrap:anywhere]">
       <Masthead report={report} index={index} quiet={quiet} />
       {quiet ? (
         report.lead && <QuietFront lead={report.lead} />
@@ -530,9 +533,9 @@ export function ReportPaper({ report, index }: { report: ReportDetail; index: Re
       <footer className="py-10 text-center">
         <div className="text-[13px] font-semibold tracking-[0.6em] text-ink-4">（本期完）</div>
         <p className="mt-3 text-[12px] text-ink-4">
-          {`${SITE.name} `}{KIND_LABEL[report.kind]}由编辑系统根据公开来源自动{daily ? "编辑" : "综合"}，每条均附原文 ·{" "}
+          {`${SITE.name} `}{REPORT_NAMES[report.kind]}根据公开报道自动{daily ? "整理" : "汇总"}，每条都附原文 ·{" "}
           <Link to={daily ? "/daily/archive" : "#report-history"} viewTransition={daily} className="font-medium text-ink-3 transition-colors hover:text-accent">
-            {daily ? "日报合订本" : `往期${KIND_LABEL[report.kind]}`}
+            {daily ? "日报合订本" : `往期${REPORT_NAMES[report.kind]}`}
           </Link>
         </p>
       </footer>

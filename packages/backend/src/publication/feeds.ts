@@ -10,10 +10,10 @@ import { escapeXml } from "../lib/text.ts";
 import { proxyBodyImages } from "../media/imgproxy.ts";
 import { feedIssues, type FeedIssue, type ReportKind } from "./reports.ts";
 import { textToHtml } from "../content/sanitize.ts";
-import type { FeedNotice } from "../modules.ts";
 import { publicCategoryCondition, exportTranslation, xView, type ItemRow } from "./items.ts";
 import { publicSourceName } from "./rules.ts";
-import { listedCondition, seatedCondition } from "./scope.ts";
+import { SELECTION } from "@aihot/industry/selection";
+import { browsedCondition, seatedCondition } from "./scope.ts";
 import { dailyUrl, itemUrl, periodUrl, siteUrl } from "./links.ts";
 
 interface FeedMeta {
@@ -29,7 +29,7 @@ interface FeedMeta {
 const CACHE = { edgeCacheSeconds: 300 };
 
 /** What the all feed leaves out: what the site names (FEED_COPY), then what the engine always leaves out. */
-const LEFT_OUT = [...FEED_COPY.allLeavesOut, "未审内容", "低相关条目", "已合并重复条目"];
+const LEFT_OUT = [...FEED_COPY.allLeavesOut, "未审内容", "低相关条目", `${SELECTION.browseFloor} 分以下条目`, "已合并重复条目"];
 
 const FEEDS: FeedMeta[] = [
   { id: "selected", path: "/feed.xml", title: `${SITE.name} — 精选`, description: `最新 50 条 ${SITE.name} 精选摘要，保留标题、站内阅读与原文入口；需要阅读器内全文可改订 /feed/full.xml。`, homePath: "/", pollHintMinutes: 30, ...CACHE },
@@ -61,18 +61,6 @@ function rfc822(d: Date): string {
   return d.toUTCString();
 }
 
-/** A module's reminder ahead of a feed's items (RequestNotices.feed). */
-function noticeXml(n: FeedNotice): string {
-  return `    <item>
-      <title>${cdata(n.title)}</title>
-      <link>${escapeXml(n.link)}</link>
-      <description>${cdata(n.description)}</description>
-      <pubDate>${rfc822(n.at)}</pubDate>
-      <guid isPermaLink="false">${escapeXml(n.guid)}</guid>
-      <author>${escapeXml(AUTHOR)} (${escapeXml(SITE.name)})</author>
-    </item>`;
-}
-
 function channel(meta: { title: string; description: string; homePath: string; selfPath: string; ttl: number }, items: string[]): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/">
@@ -91,7 +79,7 @@ ${items.join("\n")}
 }
 
 type FeedRow = Pick<ItemRow, "id" | "title" | "summary" | "url" | "category" | "published_at" | "source_name"> &
-  Partial<Pick<ItemRow, "channel" | "x_post" | "zh_text" | "quoted_zh" | "language"> & {
+  Partial<Pick<ItemRow, "channel" | "x_post" | "x_article" | "zh_text" | "quoted_zh" | "language"> & {
     syndicate: boolean; body_text: string | null; body_html: string | null; tr_html: string | null; tr_complete: boolean | null;
   }>;
 
@@ -105,7 +93,7 @@ const FEED_IMAGE_SECONDS = 7 * 86400;
  */
 function fullContent(r: FeedRow, aihot: string): string | null {
   let html: string | null = null;
-  const x = r.channel === "x" ? xView({ x_post: r.x_post ?? null, zh_text: r.zh_text ?? null, quoted_zh: r.quoted_zh ?? null }) : null;
+  const x = r.channel === "x" ? xView({ x_post: r.x_post ?? null, x_article: r.x_article ?? null, zh_text: r.zh_text ?? null, quoted_zh: r.quoted_zh ?? null }) : null;
   if (x) {
     html = textToHtml(x.translation ?? x.text);
     if (x.quoted?.text) {
@@ -151,13 +139,10 @@ export type ItemFeedKind = "selected" | "selected-full" | "all";
 // Items are the newest by their original publish time (the pubDate shown): 50 per feed; a category
 // feed holds only its last 7 days (by original publish time).
 
-/** A reminder for the feed at a path, or none (routes/feeds.ts asks the modules). */
-type NoticeFor = (feedPath: string) => FeedNotice | null;
-
-export async function itemFeed(kind: ItemFeedKind, category: PublicApiCategoryKey | null, { now = new Date(), notice }: { now?: Date; notice?: NoticeFor } = {}): Promise<string> {
+export async function itemFeed(kind: ItemFeedKind, category: PublicApiCategoryKey | null, { now = new Date() }: { now?: Date } = {}): Promise<string> {
   const includeContent = kind === "selected-full";
   const scope = kind === "all"
-    ? sql`${listedCondition(now)} AND coalesce(p.published_at, p.discovered_at) > ${now}::timestamptz - interval '7 days'
+    ? sql`${browsedCondition(now)} AND coalesce(p.published_at, p.discovered_at) > ${now}::timestamptz - interval '7 days'
         AND coalesce(p.published_at, p.discovered_at) <= ${now}`
     : sql`${seatedCondition(now)} ${publicCategoryCondition(category)}
         ${category ? sql`AND coalesce(p.published_at, p.discovered_at) >= ${new Date(now.getTime() - 7 * 86400_000)}` : sql``}`;
@@ -167,9 +152,9 @@ export async function itemFeed(kind: ItemFeedKind, category: PublicApiCategoryKe
       ORDER BY coalesce(p.published_at, p.discovered_at) DESC, p.article_id DESC LIMIT 50
     )
     SELECT p.article_id AS id, p.title, p.summary, p.url, p.category, p.published_at, s.name AS source_name
-      ${includeContent ? sql`, p.channel, p.syndicate, a.language, a.x_post,
+      ${includeContent ? sql`, p.channel, p.syndicate, a.language, a.x_post, a.x_article,
         CASE WHEN p.channel = 'x' THEN tr.body_text END AS zh_text, qt.text_zh AS quoted_zh,
-        left(a.body_text, 400) AS body_text, a.body_html, tr.body_html AS tr_html, tr.complete AS tr_complete` : sql``}
+        a.body_text, a.body_html, tr.body_html AS tr_html, tr.complete AS tr_complete` : sql``}
     FROM page JOIN publications p ON p.article_id = page.article_id JOIN sources s ON s.id = p.source_id
     ${includeContent ? sql`LEFT JOIN articles a ON a.id = p.article_id AND p.syndicate
       LEFT JOIN translations tr ON tr.article_id = p.article_id AND tr.lang = 'zh' AND tr.revision >= a.revision
@@ -190,8 +175,6 @@ export async function itemFeed(kind: ItemFeedKind, category: PublicApiCategoryKe
     };
   }
   const items = rows.map((r) => itemXml(r, includeContent));
-  const first = notice?.(meta.selfPath);
-  if (first) items.unshift(noticeXml(first));
   return channel(meta, items);
 }
 
@@ -217,12 +200,10 @@ function issueXml(kind: ReportKind, r: FeedIssue): string {
 }
 
 /** The daily, weekly or monthly feed: one item per issue, newest first. */
-export async function reportFeed(kind: ReportKind, notice?: NoticeFor): Promise<string> {
+export async function reportFeed(kind: ReportKind): Promise<string> {
   const m = feedMeta(kind);
   const meta = { title: m.title, description: m.description, homePath: m.homePath, selfPath: m.path, ttl: m.pollHintMinutes };
   const items = (await feedIssues(kind, ISSUES_KEPT[kind])).map((r) => issueXml(kind, r));
-  const first = notice?.(meta.selfPath);
-  if (first) items.unshift(noticeXml(first));
   return channel(meta, items);
 }
 

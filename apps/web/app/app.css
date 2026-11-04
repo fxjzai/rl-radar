@@ -16,8 +16,11 @@
 /* The initial family is the reader's standard browser font, unlike system-ui or sans-serif. */
 :root[data-font="browser"] { font-family: initial; }
 [data-font="browser"] body, [data-font="browser"] .font-sans { font-family: inherit; }
-/* Touch screens (no hover): pressed states for rows and cards. */
+/* Touch screens (no hover): pressed states for rows and cards, and the desktop shell's 44px targets on
+   tablets, unfolded foldables and large phones held sideways. */
 @custom-variant touch (@media (hover: none));
+/* Short windows (an unfolded foldable held sideways): the desktop sidebar scrolls as one column. */
+@custom-variant short (@media (max-height: 700px));
 
 @theme {
   --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "HarmonyOS Sans SC", "Microsoft YaHei", sans-serif;
@@ -27,12 +30,12 @@
   --color-bg: var(--bg);
   --color-bg-sunk: var(--bg-sunk);
   --color-bg-muted: var(--bg-muted);
+  --color-well: var(--well);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
   --color-raised: var(--raised);
   --color-sidebar: var(--sidebar);
   --color-daybar: var(--daybar);
-  --color-field: var(--field);
   --color-ink: var(--ink);
   --color-ink-2: var(--ink-2);
   --color-ink-3: var(--ink-3);
@@ -71,10 +74,17 @@
 
   --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
 
-  /* Breakpoints: phones ≤ 640, the mobile shell up to 960, desktop above. */
+  /* Breakpoints: phones ≤ 640, the mobile shell up to 699, desktop pages above (an unfolded Android
+     foldable upright is about 711px wide, an iPad mini 744, an iPhone Duo held sideways 951). Up to
+     `wide` the site navigation is a rail of the phone's tabs, from there the full sidebar. From `side` a
+     desktop page sets its side column (an article's rail, a reading page's aside, the report archive)
+     beside the text, which keeps about 600px next to the site sidebar; narrower desktops read in one
+     column, as phones do. */
   --breakpoint-sm: 641px;
+  --breakpoint-lg: 700px;
   --breakpoint-md: 768px;
-  --breakpoint-lg: 961px;
+  --breakpoint-wide: 941px;
+  --breakpoint-side: 1176px;
   --breakpoint-xl: 1280px;
   --breakpoint-2xl: 1536px;
 }
@@ -95,6 +105,7 @@
   --bg: #f5f5f5;
   --bg-sunk: #eeeeee;
   --bg-muted: #e5e7eb;
+  --well: var(--bg-sunk);
   --surface: #ffffff;
   --surface-2: #fafafa;
   --raised: #ffffff;
@@ -143,7 +154,7 @@
   --selection: rgba(255, 51, 47, 0.16);
 }
 
-@media (min-width: 961px) {
+@media (min-width: 700px) {
   :root {
     --bar-h: 0px;
   }
@@ -154,6 +165,7 @@
   --bg: #050505;
   --bg-sunk: #111111;
   --bg-muted: #202020;
+  --well: color-mix(in oklab, var(--bg-muted) 60%, transparent);
   --surface: #111111;
   --surface-2: #161616;
   --raised: #202020;
@@ -222,7 +234,7 @@
   :focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-    border-radius: 6px;
+    border-radius: var(--radius-mark);
   }
   a {
     color: inherit;
@@ -322,11 +334,8 @@
 /* The well: a quiet sunk panel for what navigates or annotates rather than reads (the report's 报眼,
    the hot lead's heat panel, notes on about and feedback). Radius is set where it is used. */
 @utility well {
-  background-color: var(--bg-sunk);
+  background-color: var(--well);
   box-shadow: inset 0 0 0 1px var(--line-soft);
-  [data-theme="dark"] & {
-    background-color: color-mix(in srgb, var(--bg-muted) 60%, transparent);
-  }
 }
 @utility card-hover {
   transition: box-shadow 200ms var(--ease-out-quart), border-color 200ms, transform 200ms var(--ease-out-quart);
@@ -379,9 +388,9 @@
 .anim-drop-out { animation: aihot-drop-out 140ms ease-in both; }
 .anim-notice-in { animation: aihot-notice-in 200ms var(--ease-out-quart) both; }
 .anim-zoom-in { animation: aihot-zoom-in 180ms var(--ease-out-quart) both; }
-.anim-zoom-out, .anim-fade-out > .lightbox-img { animation: aihot-zoom-out 160ms ease-in both; }
+.anim-fade-out > .lightbox-img { animation: aihot-zoom-out 160ms ease-in both; }
 .anim-sheet-in { animation: aihot-sheet-in 320ms cubic-bezier(0.22, 1, 0.36, 1) both; }
-.anim-sheet-out, .anim-fade-out > .sheet-panel { animation: aihot-sheet-out 220ms cubic-bezier(0.4, 0, 1, 1) both; }
+.anim-fade-out > .sheet-panel { animation: aihot-sheet-out 220ms cubic-bezier(0.4, 0, 1, 1) both; }
 .anim-swap-in { animation: aihot-swap-in 120ms var(--ease-out-quart) both; }
 .anim-bump { animation: aihot-bump 320ms var(--ease-out-quart) both; }
 .anim-pop-in { animation: aihot-pop-in 460ms var(--ease-out-quart) both; }
@@ -400,7 +409,7 @@
 :root[data-vt]::view-transition-new(root) {
   animation: none;
 }
-@media (max-width: 960px) {
+@media (max-width: 699px) {
   :root[data-vt="push"]::view-transition-old(root) {
     animation: aihot-page-out-left 400ms cubic-bezier(0.32, 0.72, 0, 1) both;
   }

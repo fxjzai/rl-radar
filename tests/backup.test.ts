@@ -1,12 +1,13 @@
 // Backups restore: a real database dump and file archive (uploads and feedback screenshots) are
 // unpacked and read back; the object store is a stand-in inside this process. A missing uploads directory
-// is a valid empty backup, an unreadable one is not; a file archive that fails still ships the database and
+// needs no file archive, an unreadable one is not; a file archive that fails still ships the database and
 // reports tar's own words, not the command line in front of them.
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, beforeEach, test } from "node:test";
@@ -64,7 +65,7 @@ after(async () => {
 async function extractSavedFiles() {
   const destination = await mkdtemp(path.join(tmpdir(), "aihot-backup-restored-"));
   roots.push(destination);
-  const archive = objects.get(`daily/${stem}-files-202611010400.tar.gz`);
+  const archive = objects.get(`monthly/${stem}-files-202611010400.tar.gz`);
   assert.ok(archive, "backup must supply the real file archive");
   const archivePath = path.join(destination, "files.tar.gz");
   await writeFile(archivePath, archive);
@@ -85,7 +86,7 @@ test("a real paired restore opens a feedback screenshot when forwarding is disab
   const summary = await runBackup(NOW);
   assert.equal(summary.uploaded, true);
   const { destination, data } = await extractSavedFiles();
-  const dump = objects.get(`daily/${stem}-202611010400.dump`);
+  const dump = objects.get(`monthly/${stem}-202611010400.dump`);
   assert.ok(dump, "backup must supply the real database dump");
   const dumpPath = path.join(destination, "database.dump");
   await writeFile(dumpPath, dump);
@@ -136,32 +137,46 @@ test("both attachment roots restore nested paths and bytes, without caches or pr
   assert.deepEqual((await readdir(data)).sort(), ["feedback-screenshots", "uploads"]);
   assert.deepEqual(await readFile(path.join(data, "uploads/nested/user-file.bin")), upload);
   assert.deepEqual(await readFile(path.join(data, "feedback-screenshots/local.png")), PNG);
-  assert.deepEqual([...objects.keys()].sort(), ["daily", "weekly", "monthly"].flatMap(prefix => [`${prefix}/${stem}-202611010400.dump`, `${prefix}/${stem}-files-202611010400.tar.gz`]).sort());
+  assert.deepEqual([...objects.keys()].sort(), ["monthly"].flatMap(prefix => [`${prefix}/${stem}-202611010400.dump`, `${prefix}/${stem}-files-202611010400.tar.gz`]).sort());
   for (const object of summary.objects) assert.equal(object.sha256, createHash("sha256").update(objects.get(object.key)!).digest("hex"));
 });
 
 
 // One root present and the other absent is the first test (screenshots kept, uploads absent).
-for (const dirs of [[], ["uploads", "feedback-screenshots"]]) {
-  test(`missing/empty roots produce an extractable archive: ${dirs.join("+") || "neither"}`, async () => {
-    for (const dir of dirs) await mkdir(path.join(config.dataDir, dir));
+for (const dirs of [[], ["uploads", "feedback-screenshots"], ["uploads/empty/nested"]]) {
+  test(`missing/empty roots produce only the database backup: ${dirs.join("+") || "neither"}`, async () => {
+    for (const dir of dirs) await mkdir(path.join(config.dataDir, dir), { recursive: true });
     const summary = await runBackup(NOW);
     assert.equal(summary.uploaded, true);
-    const { data } = await extractSavedFiles();
-    assert.deepEqual((await readdir(data)).sort(), [...dirs].sort());
-    for (const dir of dirs) assert.deepEqual(await readdir(path.join(data, dir)), []);
+    assert.equal(summary.objects.length, 1);
+    assert.ok(summary.objects[0]!.key.endsWith(".dump"));
+    assert.equal((await readdir(path.join(config.dataDir, "backups"))).length, 1);
   });
 }
 
 test("an unreadable upload directory cannot become a successful empty backup", async () => {
   assert.equal((await runBackup(NOW)).uploaded, true);
   const shipped = objects.size;
-  const [last] = await sql`SELECT value FROM settings WHERE key = 'backup.last'`;
   await symlink("uploads", path.join(config.dataDir, "uploads")); // ELOOP, without depending on root/permission behavior
   await assert.rejects(runBackup(new Date("2026-11-01T04:01:00Z")), /ELOOP/);
-  assert.equal(objects.size, shipped, "do not send an empty archive as a replacement for unreadable files");
+  assert.equal(objects.size, shipped + 1, "ship the new database without an empty replacement for unreadable files");
   const [after] = await sql`SELECT value FROM settings WHERE key = 'backup.last'`;
-  assert.deepEqual(after, last, "last successful backup remains accurate");
+  assert.equal(after!.value.uploaded, false, "unreadable attachments cannot count as a successful backup");
+  assert.match(after!.value.filesError, /ELOOP/);
+});
+
+test("unreadable nested directories still ship the database and fail the attachment backup", { skip: process.getuid?.() === 0 }, async () => {
+  await save("uploads/restricted/file.txt", Buffer.from("fixture"));
+  const directory = path.join(config.dataDir, "uploads/restricted");
+  await chmod(directory, 0);
+  try {
+    await assert.rejects(runBackup(NOW), /database backed up, but the file archive failed:.*EACCES/);
+    assert.equal(objects.size, 1);
+    assert.ok([...objects.keys()][0]!.endsWith(".dump"));
+    const [row] = await sql`SELECT value FROM settings WHERE key = 'backup.last'`;
+    assert.equal(row!.value.uploaded, false);
+    assert.match(row!.value.filesError, /EACCES/);
+  } finally { await chmod(directory, 0o700); }
 });
 
 async function withPackingFailures(failures: number, action: (count: () => Promise<number>) => Promise<void>) {
@@ -204,13 +219,13 @@ test("persistent packing failure still sends the database and reports incomplete
     await assert.rejects(runBackup(NOW), /database backed up, but the file archive failed: fictional packing failure/);
     assert.equal(await count(), 2);
   });
-  assert.equal(objects.size, 3);
+  assert.equal(objects.size, 1);
   assert.ok([...objects.keys()].every(key => key.endsWith(".dump")));
   const [row] = await sql`SELECT value FROM settings WHERE key = 'backup.last'`;
   assert.equal(row!.value.uploaded, false);
   assert.match(row!.value.filesError, /^fictional packing failure/);
   assert.doesNotMatch(row!.value.filesError, /Command failed|-czf/, "the command line would crowd out the reason");
-  assert.equal(row!.value.objects.length, 3);
+  assert.equal(row!.value.objects.length, 1);
   assert.deepEqual(await readFile(path.join(config.dataDir, "feedback-screenshots/failure.png")), PNG);
 });
 
@@ -219,4 +234,131 @@ test("local retention keeps three dump/archive pairs without deleting source att
   for (const day of [1, 2, 3, 4]) await runBackup(new Date(`2026-11-0${day}T04:00:00Z`));
   assert.deepEqual((await readdir(path.join(config.dataDir, "backups"))).sort(), [2, 3, 4].flatMap(day => [`${stem}-2026110${day}0400.dump`, `${stem}-files-2026110${day}0400.tar.gz`]).sort());
   assert.deepEqual(await readFile(path.join(config.dataDir, "feedback-screenshots/retained.png")), PNG);
+});
+
+test("a failed database dump keeps connection credentials out of argv and the reported error", async () => {
+  const bin = path.join(config.dataDir, "dump-bin");
+  await mkdir(bin);
+  const captured = path.join(bin, "invocation.json");
+  await writeFile(path.join(bin, "pg_dump"), `#!${process.execPath}
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(captured)}, JSON.stringify({ args: process.argv.slice(2), user: process.env.PGUSER, password: process.env.PGPASSWORD }));
+console.error("fictional dump refusal");
+process.exit(2);
+`, { mode: 0o755 });
+  const originalUrl = config.databaseUrl;
+  const originalPath = process.env.PATH;
+  const connection = new URL(originalUrl);
+  connection.username = "fictional-backup-user";
+  connection.password = "fictional-p@ss:word";
+  config.databaseUrl = connection.href;
+  process.env.PATH = `${bin}:${originalPath}`;
+  try {
+    for (const queryCredentials of [false, true]) {
+      if (queryCredentials) {
+        connection.username = connection.password = "";
+        connection.searchParams.set("user", "fictional-backup-user");
+        connection.searchParams.set("password", "fictional-p@ss:word");
+        config.databaseUrl = connection.href;
+      }
+      await assert.rejects(runBackup(NOW), (error: Error) => {
+        assert.match(error.message, /fictional dump refusal/);
+        assert.doesNotMatch(error.message, /fictional-backup-user|fictional-p|p%40ss|word@/);
+        return true;
+      });
+      const invocation = JSON.parse(await readFile(captured, "utf8"));
+      assert.doesNotMatch(JSON.stringify(invocation.args), /fictional-backup-user|fictional-p|p%40ss|word@/);
+      assert.equal(invocation.user, "fictional-backup-user");
+      assert.equal(invocation.password, "fictional-p@ss:word");
+    }
+    assert.equal(objects.size, 0);
+  } finally {
+    config.databaseUrl = originalUrl;
+    process.env.PATH = originalPath;
+  }
+});
+
+
+// A release must let the real dump/archive finish and record its uploaded pair before the worker exits.
+// Killing every process with SIGTERM used to interrupt pg_dump (and make tar need a second attempt).
+for (const phase of ["pg_dump", "tar"] as const) {
+  test(`worker stop drains a real ${phase} without terminating or restarting it`, { timeout: 30_000 }, async () => {
+    const locked = await sql.reserve();
+    await sql`CREATE TABLE IF NOT EXISTS backup_shutdown_probe (id integer)`;
+    await locked`BEGIN`;
+    if (phase === "pg_dump") await locked`LOCK TABLE backup_shutdown_probe IN ACCESS EXCLUSIVE MODE`;
+    if (phase === "tar") await save("uploads/synthetic.bin", randomBytes(16 * 1024 * 1024));
+    const messages: Array<{ cmd?: string; pid?: number; completed?: boolean; error?: string }> = [];
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", `
+      import assert from "node:assert/strict";
+      import cp from "node:child_process";
+      import { syncBuiltinESMExports } from "node:module";
+      const exec = cp.execFile;
+      cp.execFile = (...args) => {
+        const child = exec(...args);
+        process.send({ cmd: args[0], pid: child.pid });
+        return child;
+      };
+      syncBuiltinESMExports();
+      const { runBackup } = await import("@aihot/backend/operations/backup");
+      const { getBoss, stopBoss } = await import("@aihot/backend/jobs/queue");
+      const { closeDb } = await import("@aihot/backend/db");
+      globalThis.fetch = async (input, init) => {
+        assert.equal(new URL(input).origin, "https://backup.invalid");
+        for await (const chunk of init.body) {} // consume the real dump/archive, never send it outside
+        return new Response(null, { status: 200 });
+      };
+      const boss = await getBoss();
+      const name = "test.backup.shutdown";
+      await boss.createQueue(name, { retryLimit: 0 });
+      await boss.work(name, { pollingIntervalSeconds: 0.5 }, async () => {
+        try { await runBackup(); process.send({ completed: true }); }
+        catch (error) { process.send({ error: error.message }); throw error; }
+      });
+      process.once("SIGTERM", async () => { await stopBoss(); await closeDb(); process.exit(0); });
+      await boss.send(name, {});
+    `], { cwd: path.resolve(import.meta.dirname, ".."), env: { ...process.env, AIHOT_DATA_DIR: config.dataDir }, detached: true, stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    let stderr = "";
+    child.stderr!.on("data", chunk => { stderr += String(chunk); });
+    child.on("message", message => messages.push(message as typeof messages[number]));
+    const exited = once(child, "exit");
+    const wait = async (condition: () => boolean | Promise<boolean>) => {
+      const deadline = Date.now() + 15_000;
+      while (!await condition()) {
+        assert.ok(child.exitCode === null && child.signalCode === null && Date.now() < deadline, `backup phase not reached: ${stderr} ${JSON.stringify(messages)}`);
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    };
+    let held: number | undefined;
+    try {
+      await wait(() => messages.some(message => message.cmd === phase));
+      if (phase === "pg_dump") {
+        await wait(async () => (await sql`SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND application_name = 'pg_dump' AND wait_event_type = 'Lock'`).length > 0);
+      } else {
+        held = messages.find(message => message.cmd === phase)!.pid!;
+        process.kill(held, "SIGSTOP");
+      }
+      // The supervisor sends the graceful signal to the worker, which owns its child lifetimes.
+      process.kill(child.pid!, "SIGTERM");
+      await locked`ROLLBACK`;
+      if (held) { process.kill(held, "SIGCONT"); held = undefined; }
+      const [code, signal] = await exited;
+      assert.equal(signal, null, stderr);
+      assert.equal(code, 0, stderr);
+      assert.ok(messages.some(message => message.completed), JSON.stringify(messages));
+      assert.equal(messages.filter(message => message.cmd === phase).length, 1, "shutdown must not restart a killed backup subprocess");
+    } finally {
+      await locked`ROLLBACK`;
+      locked.release();
+      if (held) process.kill(held, "SIGCONT");
+      if (child.exitCode === null && child.signalCode === null) { process.kill(-child.pid!, "SIGKILL"); await exited; }
+    }
+  });
+}
+
+test("a real dump preserves libpq query parameter escaping", async () => {
+  const originalUrl = config.databaseUrl;
+  config.databaseUrl = `${originalUrl}${originalUrl.includes("?") ? "&" : "?"}options=-c%20statement_timeout%3D0&application_name=fictional%2Bbackup`;
+  try { assert.equal((await runBackup(NOW)).uploaded, true); }
+  finally { config.databaseUrl = originalUrl; }
 });

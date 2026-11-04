@@ -16,14 +16,14 @@ let starting: Promise<PgBoss> | null = null;
 export interface JobData {
   "content.analyze": { articleId: string; attemptTag?: string };
   "content.extract-body": { articleId: string };
-  "events.group": { articleId: string; signalOnly?: boolean };
+  "events.group": { articleId: string; signalOnly?: boolean; regroup?: boolean };
   "events.digest": { storyId: number };
   "sources.fetch": { sourceId: string; force?: boolean };
   "sources.fetch-x": { key: string; sourceIds: string[] };
   "sources.mp": { sourceId: string; reason?: "schedule" | "manual" };
   "notify.selected": { articleId: string; attempt?: number };
   "publication.republish-source": { sourceId: string };
-  "media.prepare": { articleId: string } | { url: string; mode: string };
+  "media.prepare": { articleId: string } | { url: string; mode: string; format?: "avif" };
 }
 export type QueueName = keyof JobData;
 
@@ -58,10 +58,11 @@ const QUEUE_OPTIONS: Record<QueueName, QueueOptions> = {
 
 const ensured = new Set<string>();
 
-export async function getBoss(): Promise<PgBoss> {
+/** Only the worker owns timer dispatch and queue maintenance; other processes submit work. */
+export async function getBoss({ supervise = false } = {}): Promise<PgBoss> {
   if (boss) return boss;
   starting ??= (async () => {
-    const b = new PgBoss({ connectionString: config.databaseUrl, max: 4, schema: "pgboss", application_name: "aihot-jobs" });
+    const b = new PgBoss({ connectionString: config.databaseUrl, max: 4, schema: "pgboss", application_name: "aihot-jobs", schedule: supervise, supervise });
     b.on("error", (err) => console.error("[pg-boss]", logError(err)));
     try {
       await b.start();
@@ -78,8 +79,8 @@ export async function getBoss(): Promise<PgBoss> {
   return starting;
 }
 
-/** The longest single paid call (a translation batch, 180 s) plus margin; whatever stops the worker (systemd, Docker) waits longer. */
-export const STOP_TIMEOUT_MS = 195_000;
+/** Let in-flight backups and paid calls finish; process supervisors wait longer for cleanup. */
+export const STOP_TIMEOUT_MS = 470_000;
 
 export async function stopBoss(): Promise<void> {
   shutdownSignal.abort();

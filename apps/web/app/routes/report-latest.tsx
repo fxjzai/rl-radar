@@ -1,6 +1,6 @@
 import { useLoaderData } from "react-router";
 import type { Route } from "./+types/report-latest";
-import type { ReportLatestPage } from "@aihot/contracts/site";
+import { REPORT_NAMES, reportDateLabel, type ReportLatestPage } from "@aihot/contracts/site";
 import { REPORTS, subjectAfter, withSubject } from "@aihot/site";
 import { cachedPage, loadOr404 } from "../lib/api.server";
 import { pageReuse } from "../lib/page-reuse";
@@ -9,7 +9,7 @@ import { beijingDate } from "@aihot/contracts/time";
 import { EmptyState } from "../components/ui/Page";
 import { ReportLayout } from "../features/report/ReportLayout";
 import { ReportPaper, reportOutline } from "../features/report/ReportPaper";
-import { KIND_LABEL, feedLink, kindFromPath } from "../features/report/format";
+import { feedLink, kindFromPath } from "../features/report/format";
 import type { Screen } from "../components/shell/screens";
 
 export const handle: Screen = { tab: "daily", name: "日报" };
@@ -24,15 +24,17 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 export function meta({ loaderData, location }: Route.MetaArgs) {
   const kind = loaderData?.kind ?? "daily";
-  const description = `${REPORTS.descriptions[kind]}。`;
   const report = loaderData?.report;
+  // What this issue says, so a search result shows today's date and news rather than what the page is.
+  const lead = report?.lead?.leadParagraph ?? report?.overview?.slice(0, 150);
+  const description = report && lead ? `${reportDateLabel(kind, report.key)} ${withSubject("资讯")}：${lead}` : `${REPORTS.descriptions[kind]}。`;
   return [...pageMeta({
-    title: withSubject(KIND_LABEL[kind]),
+    title: withSubject(REPORT_NAMES[kind]),
     description,
     path: location.pathname,
     image: `/og/pages/${kind}.png`,
     // The latest issue, described at this page's own address (its canonical).
-    jsonLd: report ? reportLd(report, location.pathname, report.lead?.leadParagraph ?? description) : undefined,
+    jsonLd: report ? reportLd(report, location.pathname, lead ?? description) : undefined,
   }), feedLink(kind)];
 }
 
@@ -40,7 +42,7 @@ export default function ReportLatestPage() {
   const { kind, report, index, today } = useLoaderData<typeof loader>();
   return (
     <ReportLayout kind={kind} index={index} current={report?.key ?? null} today={today} outline={report ? reportOutline(report) : []}>
-      {report ? <ReportPaper report={report} index={index} /> : <EmptyState title={subjectAfter("还没有发布", KIND_LABEL[kind])}>第一期发布后会出现在这里。</EmptyState>}
+      {report ? <ReportPaper report={report} index={index} /> : <EmptyState title={subjectAfter("还没有发布", REPORT_NAMES[kind])}>第一期发布后会出现在这里。</EmptyState>}
     </ReportLayout>
   );
 }

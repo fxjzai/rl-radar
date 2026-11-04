@@ -1,6 +1,8 @@
 // A listing read through Jina is a paid request of its own on every fetch, with its own receipt: a read
 // whose outcome is unknown is never sent again and is left to ops.recover, the next fetch reads the
-// listing afresh, and a page received before a storage failure stays on its receipt.
+// listing afresh, and a page received before a storage failure stays on its receipt. A read keyed by its
+// caller's round is paid once a round. A JSON listing
+// embedded in a page that blocks our addresses (Hark's Cloudflare) is read from Jina's rendered HTML.
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -9,6 +11,7 @@ import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import { autoReleaseUnknownReceipts } from "@aihot/backend/operations/recover";
 import { stopBoss } from "@aihot/backend/jobs/queue";
+import { jinaRead } from "@aihot/backend/providers/jina";
 import { collectSource } from "@aihot/backend/sources/collect";
 import { previewStoredSource } from "@aihot/backend/admin/sources";
 
@@ -20,6 +23,16 @@ const SOURCE = `test-jina-listing-${T}`;
 let mode: "drop" | "page" = "drop";
 let hits = 0;
 const jina = http.createServer((req, res) => {
+  if (req.url?.endsWith("/nul-response")) {
+    hits += 1;
+    res.writeHead(200, { "content-type": "text/plain", "x-request-id": "nul-fixture", "x-usage-tokens": "100" });
+    return void res.end("Title: 原文\n\nMarkdown Content:\n正文\0内容😀\n");
+  }
+  if (req.headers["x-return-format"] === "html" && req.url?.endsWith("/articles")) {
+    res.writeHead(200, { "content-type": "text/plain" });
+    const items = [{ _key: "k1", slug: `embedded-${T}`, title: `Embedded ${T}`, publicationDate: "2026-09-24", tags: ["product"] }];
+    return void res.end(`Title: Articles\n\nMarkdown Content:\n<html><body><script>self.__next_f.push([1,${JSON.stringify(`3:["$","main",null,{"items":${JSON.stringify(items)}}]\n`)}])</script></body></html>`);
+  }
   if (req.headers["x-return-format"] === "html") {
     res.writeHead(200, { "content-type": "text/plain" });
     return void res.end(`<html><body><article><a href="/blog/rendered-${T}"><time datetime="2026-09-23">September 23, 2026</time><h2>Rendered ${T}</h2></a></article></body></html>`);
@@ -85,9 +98,40 @@ test("a listing parsed with selectors is read from Jina as rendered HTML, dates 
             ${sql.json({ initializedAt: "2026-09-01T00:00:00.000Z" })})`;
   const run = await collectSource(id, { force: true });
   assert.equal(run.status, "ok", run.error ?? "");
-  const [post] = await sql<{ title: string; published_at: Date }[]>`SELECT title, published_at FROM articles WHERE source_id = ${id}`;
+  const [post] = await sql<{ title: string; published_at: Date; publication_time: string }[]>`SELECT title, published_at, publication_time FROM articles WHERE source_id = ${id}`;
   assert.equal(post?.title, `Rendered ${T}`);
-  assert.equal(post?.published_at.toISOString(), "2026-09-23T00:00:00.000Z");
+  assert.equal(post?.published_at.toISOString(), "2026-09-22T16:00:00.000Z");
+  assert.equal(post?.publication_time, "2026-09-23");
+});
+
+test("a JSON listing embedded in a page is read from Jina as rendered HTML", async () => {
+  const id = `${SOURCE}-json`;
+  await sql`INSERT INTO sources (id, name, kind, tier, participation_mode, next_fetch_at, config, cursor)
+    VALUES (${id}, 'Jina JSON listing', 'json_list', 'T1', 'editorial', '2100-01-01',
+            ${sql.json({ url: "https://r.jina.ai/https://example.org/articles", mode: "html_json_key", jsonKey: "items", titlePaths: ["title"],
+              urlTemplate: "https://example.org/articles/{slug}", externalIdPath: "_key", publishedAtPath: "publicationDate" })},
+            ${sql.json({ initializedAt: "2026-09-01T00:00:00.000Z" })})`;
+  const run = await collectSource(id, { force: true });
+  assert.equal(run.status, "ok", run.error ?? "");
+  const [post] = await sql<{ title: string; url: string; published_at: Date; publication_time: string }[]>`SELECT title, url, published_at, publication_time FROM articles WHERE source_id = ${id}`;
+  assert.equal(post?.title, `Embedded ${T}`);
+  assert.equal(post?.url, `https://example.org/articles/embedded-${T}`);
+  assert.equal(post?.published_at.toISOString(), "2026-09-23T16:00:00.000Z");
+  assert.equal(post?.publication_time, "2026-09-24");
+  assert.equal((await sql`SELECT 1 FROM receipts WHERE subject = ${`source:${id}`} AND service = 'jina'`).length, 1);
+});
+
+test("a read keyed by its caller's round is paid once a round: a retry reuses it, the next round reads afresh", async () => {
+  mode = "page";
+  const before = hits;
+  const read = (round: string) => jinaRead("https://example.org/news/", { purpose: "test.round", subject: `round:${T}`, round });
+  const first = await read("r1");
+  const retry = await read("r1");
+  assert.equal(retry.receiptId, first.receiptId);
+  assert.equal(hits, before + 1, "the same round is paid once");
+  const next = await read("r2");
+  assert.notEqual(next.receiptId, first.receiptId);
+  assert.equal(hits, before + 2);
 });
 
 // A paid page can arrive before a database error: it is saved on the fetch's receipt before anything is
@@ -111,9 +155,31 @@ test("a listing page received before a storage failure stays on its receipt", as
   assert.equal(hits, before + 2);
 });
 
-test("each admin preview is a paid read of its own", async () => {
+// Two reads can see the same clock reading: a CI VM's clock steps back (Check run 39178263522 reused one
+// preview's receipt for the next).
+test("each admin preview is a paid read of its own, even at the same clock reading", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const before = hits;
   assert.equal((await previewStoredSource(SOURCE))!.count, 1);
   assert.equal((await previewStoredSource(SOURCE))!.count, 1);
   assert.equal(hits, before + 2);
+});
+
+test("a received Jina page with NUL persists its receipt and reuses it without another paid call", async () => {
+  const before = hits;
+  const url = `https://example.org/${T}/nul-response`;
+  const options = { purpose: "source_detail", subject: `source:${SOURCE}-nul` };
+  const first = await jinaRead(url, options);
+  const second = await jinaRead(url, options);
+  assert.equal(first.markdown, "正文�内容😀");
+  assert.equal(second.raw, first.raw);
+  assert.equal(second.receiptId, first.receiptId);
+  assert.equal(hits, before + 1);
+  const [receipt] = await sql`SELECT status, attempts, request_id, usage FROM receipts WHERE id = ${first.receiptId}`;
+  assert.equal(receipt!.status, "received");
+  assert.equal(receipt!.attempts, 1);
+  assert.equal(receipt!.request_id, "nul-fixture");
+  assert.equal(receipt!.usage.tokens, 100);
+  const attempts = await sql`SELECT status FROM receipt_attempts WHERE receipt_id = ${first.receiptId}`;
+  assert.deepEqual(attempts.map(row => row.status), ["received"]);
 });

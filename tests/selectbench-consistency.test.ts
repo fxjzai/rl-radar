@@ -33,6 +33,25 @@ test("conflicting gold for a shared case returns 400 before any report writes", 
   }
 });
 
+test("every invalid report returns 400 before any report writes", async (t) => {
+  const reports: Record<string, unknown> = {
+    "no summaries": { models: { first: { cases: [item] } } },
+    "cases not an array": { models: { first: { summary: {}, cases: {} } } },
+    "blank caseId": { models: { first: { summary: {}, cases: [{ ...item, caseId: " " }] } } },
+    "duplicate caseId": { models: { first: { summary: {}, cases: [item, item] } } },
+    "invalid gold": { models: { first: { summary: {}, cases: [{ ...item, gold: "SELECT" }] } } },
+  };
+  for (const [name, report] of Object.entries(reports)) {
+    await t.test(name, async () => {
+      const before = await counts();
+      const response = await app.inject({ method: "POST", url: "/api/admin/selectbench/import",
+        headers: { "x-csrf-token": "dev" }, payload: { label: name, report } });
+      assert.equal(response.statusCode, 400, response.body);
+      assert.deepEqual(await counts(), before);
+    });
+  }
+});
+
 test("shared gold keeps model disagreements and correct outcome filters comparable", async () => {
   const { id } = await importSelectBenchRun({ models: {
     first: { summary: {}, cases: [item, { ...item, caseId: "first-only", gold: "reject", decision: "reject" }] },

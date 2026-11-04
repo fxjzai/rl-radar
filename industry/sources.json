@@ -1,5 +1,5 @@
 {
-  "$comment": "示范信源：首次启动时导入（scripts/seed.ts），已存在的不会被覆盖。之后在后台“信源”里新建、修改和暂停。字段说明见 docs/customize.md。",
+  "$comment": "反向加载信源清单：setup 执行 scripts/seed.ts 时只补充不存在的 ID，不覆盖后台已有配置；新增来源默认只公开摘要和原文链接。字段说明见 docs/sources.md。",
   "sources": [
     {
       "id": "rss-openai-news",
@@ -362,6 +362,155 @@
       "interval_minutes": 180,
       "tags": [
         "个人"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "web-anthropic-news",
+      "name": "Anthropic News",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.anthropic.com/news",
+        "itemSelector": "main li[data-listing-row]",
+        "linkSelector": "a:has(h3), h3 a",
+        "titleSelector": "h3",
+        "publishedAtSelector": "time",
+        "publishedAtUtcOffset": "+00:00",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        },
+        "acceptLanguage": "en-US,en;q=0.9"
+      },
+      "tier": "T1",
+      "owner_entity_id": "anthropic",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "web-anthropic-engineering",
+      "name": "Anthropic Engineering",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.anthropic.com/engineering",
+        "itemSelector": "main article[data-listing-row]",
+        "linkSelector": "h3 a",
+        "titleSelector": "h3",
+        "publishedAtSelector": "time",
+        "publishedAtUtcOffset": "+00:00",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        },
+        "acceptLanguage": "en-US,en;q=0.9"
+      },
+      "tier": "T1",
+      "owner_entity_id": "anthropic",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方",
+        "研究"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "web-deepseek-updates",
+      "name": "DeepSeek 更新日志",
+      "kind": "web_list",
+      "config": {
+        "url": "https://api-docs.deepseek.com/updates/",
+        "parseMode": "docusaurus_changelog",
+        "preserveUrlFragment": true,
+        "publishedAtUtcOffset": "+08:00",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        },
+        "acceptLanguage": "en-US,en;q=0.9"
+      },
+      "tier": "T1",
+      "owner_entity_id": "deepseek",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "web-minimax-research",
+      "name": "MiniMax Research",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.minimax.io/blog",
+        "itemSelector": "a:has(article):has(time)",
+        "titleSelector": "h2",
+        "publishedAtSelector": "time",
+        "publishedAtUtcOffset": "+00:00",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        },
+        "acceptLanguage": "en-US,en;q=0.9"
+      },
+      "tier": "T1",
+      "owner_entity_id": "minimax",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方",
+        "研究"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "web-cursor-changelog",
+      "name": "Cursor Changelog",
+      "kind": "web_list",
+      "config": {
+        "url": "https://cursor.com/changelog",
+        "itemSelector": "main div.grid-cursor:has(> div > p > a > time):has(h1)",
+        "linkSelector": "h1 a",
+        "titleSelector": "h1",
+        "publishedAtSelector": "time",
+        "publishedAtUtcOffset": "+00:00",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        },
+        "acceptLanguage": "en-US,en;q=0.9"
+      },
+      "tier": "T1",
+      "owner_entity_id": "cursor",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "rss-qbitai",
+      "name": "量子位",
+      "kind": "rss",
+      "config": {
+        "feedUrl": "https://www.qbitai.com/feed/",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T2",
+      "owner_entity_id": null,
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "媒体"
       ],
       "site_fulltext": false,
       "syndicate_fulltext": false

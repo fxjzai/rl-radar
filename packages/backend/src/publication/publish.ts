@@ -4,9 +4,8 @@
 import { toPublicApiCategory } from "@aihot/contracts/taxonomy";
 import { SITE } from "@aihot/site";
 import { one, sql, type Tx } from "../db.ts";
-import { audit } from "../audit.ts";
 import { sha256, stableJson } from "../lib/ids.ts";
-import { collapseWhitespace } from "../lib/text.ts";
+import { collapseWhitespace, isChineseText } from "../lib/text.ts";
 import type { XPostData } from "../content/materials.ts";
 import { originalPostCopy } from "../content/posts.ts";
 import { itemUrl } from "./links.ts";
@@ -163,6 +162,8 @@ async function appendLedger(tx: Tx, articleId: string, op: "upsert" | "remove", 
 }
 
 /**
+ * Seats are per fact, never per story: a launch, a later evaluation and a fix are separate news, each with
+ * its own card in its own place; the story page tells how they connect.
  * Ordinary reports share one selected seat per fact: among the fact's selected public reports,
  * the representative (first-party, full text, higher score, earliest) takes it, and a
  * change of representative removes the old one and adds the new one.
@@ -220,31 +221,20 @@ async function syncLedger(tx: Tx, articleId: string, now: Date): Promise<"upsert
   return "remove";
 }
 
-/** Refresh a saved sync payload after a public-format change, without rerunning editorial decisions. */
-export async function refreshSelectedPayload(articleId: string, actor: string, reason: string): Promise<"upsert" | "remove" | null> {
-  return sql.begin(async (tx) => {
-    await tx`SELECT 1 FROM articles WHERE id = ${articleId} FOR UPDATE`;
-    const [before] = await tx`SELECT in_set, payload_hash, last_seq FROM selected_state WHERE article_id = ${articleId}`;
-    const op = await syncLedger(tx, articleId, new Date());
-    if (op) {
-      const [after] = await tx`SELECT in_set, payload_hash, last_seq FROM selected_state WHERE article_id = ${articleId}`;
-      await audit(actor, "content.refresh-selected-payload", `content:${articleId}`, reason, before, after, { db: tx });
-    }
-    return op;
-  });
+export async function publishArticle(articleId: string, options: PublishOptions = {}): Promise<PublishResult | null> {
+  return sql.begin((tx) => republishTx(tx, articleId, options));
 }
 
-export async function publishArticle(articleId: string, options: PublishOptions = {}): Promise<PublishResult | null> {
-  return sql.begin(async (tx) => {
-    await tx`SELECT 1 FROM articles WHERE id = ${articleId} FOR UPDATE`;
-    const [previous] = await tx<{ story_id: number | null }[]>`SELECT story_id FROM publications WHERE article_id = ${articleId}`;
-    const result = await publishArticleTx(tx, articleId, options);
-    // Body and translation writes announce their own changes; an unchanged projection needs no purge.
-    if (previous && result?.changed) await emit("articleChanged", {
-      id: articleId, reason: "republication", kind: result.changeKind, reduced: result.reduced, previousStoryIds: previous.story_id === null ? [] : [previous.story_id],
-    }, tx);
-    return result;
-  });
+/** publishArticle inside the caller's transaction: the write behind it and every exit commit together. */
+export async function republishTx(tx: Tx, articleId: string, options: PublishOptions = {}): Promise<PublishResult | null> {
+  await tx`SELECT 1 FROM articles WHERE id = ${articleId} FOR UPDATE`;
+  const [previous] = await tx<{ story_id: number | null }[]>`SELECT story_id FROM publications WHERE article_id = ${articleId}`;
+  const result = await publishArticleTx(tx, articleId, options);
+  // Body and translation writes announce their own changes; an unchanged projection needs no purge.
+  if (previous && result?.changed) await emit("articleChanged", {
+    id: articleId, reason: "republication", kind: result.changeKind, reduced: result.reduced, previousStoryIds: previous.story_id === null ? [] : [previous.story_id],
+  }, tx);
+  return result;
 }
 
 export async function publishArticleTx(tx: Tx, articleId: string, options: PublishOptions = {}): Promise<PublishResult | null> {
@@ -281,7 +271,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
   const now = options.now ?? new Date();
 
   const f = override?.fields ?? {};
-  const isChineseTitle = article.language === "zh" || /[一-鿿]/.test(article.title);
+  const isChineseTitle = isChineseText(article.title, article.language);
   // An X post carries its Chinese in the summary and translation; without a Chinese title its own
   // text is the title, where an article would still be a half-finished card.
   const zhTitle = analysis?.title_zh?.trim() ? analysis.title_zh : null;
@@ -302,6 +292,8 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
     && (!article.backfill || article.published_at !== null || !!options.releasedAt);
   const selectionCandidate = isSelectable(eligible, judgedSelected, source.tier);
   // Scoring nominates a report; a completed identity/value decision admits it to selection.
+  // Nothing releases a candidate without one: a timeout, a missing or invalid answer is no evidence the
+  // report is new, so it waits (readable in the pool) rather than risk a repeat in the selection and its push.
   // A historical import already has its public decision. Preserve that confirmed state on rebuild.
   const selected = selectionCandidate && article.grouping_status === "complete"
     && (f.selected === true || article.selection_adds_value !== false);

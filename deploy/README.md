@@ -62,9 +62,17 @@ systemctl enable --now rlradar-worker-window.timer
 
 ```bash
 cd /opt/rl-radar
-git pull
-dc pull
-dc --profile https up -d --no-build db setup api web caddy
+dc() { docker compose -f docker-compose.yml -f deploy/compose.ghcr.yml "$@"; }
+# 先核对可恢复的备份；迁移期间不允许定时器重新拉起旧 worker。
+# 每一步成功才继续；setup 失败时保持旧服务和定时器停止，先处理迁移错误。
+git pull --ff-only &&
+dc pull &&
+systemctl stop rlradar-worker-window.timer &&
+dc stop worker api web &&
+dc up -d --no-build db &&
+dc run --rm --no-deps setup &&
+dc --profile https up -d --no-build api web caddy &&
+systemctl start rlradar-worker-window.timer
 ```
 
 只更新 worker 时（窗口内它会被定时器自动拉起，不需要手动）：
@@ -72,6 +80,38 @@ dc --profile https up -d --no-build db setup api web caddy
 ```bash
 dc --profile https up -d --no-build worker   # 仅当处在闲时窗口内
 ```
+
+### 2026-11-04 上游同步与首批补源
+
+引擎从 `e57da5a` 同步至 AIHOT `cd424b0`（95 个提交）。新增 12 个迁移文件，
+包含发布时间精度、信源类别/用途、反馈字段和公众号身份索引；还会移除已停用的
+`translation_attempts.request_tag` 列。按照上面的停服顺序升级，不能让旧 worker 与新 schema 同时运行。
+
+本站保留红黑品牌、官网入口、模型图片声明、飞书 JSON 2.0 卡片和夜间 worker 策略。
+新版“全部动态”的 `browseFloor` 在本站设为 `0`，继续展示原有范围；不直接采用上游的 40 分过滤。
+信源类别是新增的可选功能，旧信源不自动分配类别；没有用本站标注样本校准前不改变评分门槛。
+
+`industry/sources.json` 新增以下来源。`setup` 每次执行都会运行幂等 seed，补充缺少的 ID，
+保留已有同 ID 信源的启停、配置和后台修改；因此已有站点也会获得新源。
+
+| ID | 来源 | 采集方式 |
+| --- | --- | --- |
+| `web-anthropic-news` | Anthropic News | 网页文章列表 |
+| `web-anthropic-engineering` | Anthropic Engineering | 网页文章列表（原文路径可为 `/research/`） |
+| `web-deepseek-updates` | DeepSeek 更新日志 | 按日期、标题锚点拆分更新 |
+| `web-minimax-research` | MiniMax Research | 网页文章卡片 |
+| `web-cursor-changelog` | Cursor Changelog | 网页更新列表 |
+| `rss-qbitai` | 量子位 | `https://www.qbitai.com/feed/`，保留结尾斜杠 |
+
+新增源只公开摘要和原文链接，两个全文许可都关闭；首次每源最多回填 8 条，旧内容按历史归档，
+不批量推送。网页源明确请求英文，避免语言协商使列表和正文变成不同语言。
+发布后在后台试抓并核对日期、标题、正文及错误记录，尤其检查生产出口访问量子位 RSS 是否正常；
+本机不带结尾斜杠的地址曾返回 403。首次采集与处理仍只在夜间窗口发生。
+
+本地验证使用 2026-11-04 获取的 24 份真实订阅/列表快照，对比升级前后共 2854 条候选：
+条数、原文链接和发布时间均无变化。51 篇的标题/摘要或 HTML 有差异：主要是正确解码字符实体，
+两条摘要在解码后重新截断，另有一篇保留原站标题旁的锚点链接图标；正文文字未变。
+六个新增源共解析 101 条候选，全部带日期。这个对比只验证解析，不代表已经在生产完成采集、评分或发布。
 
 ## 闲时窗口
 
@@ -147,15 +187,17 @@ DB_BACKUP_STORE_DOMAIN=<bucket>.s3.oss-<region>.aliyuncs.com
 过期对象由桶生命周期清理：`daily/` 30 天、`weekly/` 56 天、`monthly/` 366 天。
 应用不会替代管理员创建或核验这些云端规则，变更后应在 OSS 后台复核。
 
-每次生成同一时间戳的一对数据库 custom-format `.dump` 和附件 `.tar.gz`，文件名使用 UTC。
+每次生成数据库 custom-format `.dump`，有附件时再生成同一时间戳的 `.tar.gz`，文件名使用 UTC。
 附件范围为 `uploads/` 和仍需本地保存的 `feedback-screenshots/`；已转发到飞书的图片只保留数据库引用，
-图片缓存不入包。本机每类只留最新 3 份；周日额外写 `weekly/`，每月 1 日额外写 `monthly/`。
+图片缓存不入包。本机每类只留最新 3 份。每个文件只上传一次：每月 1 日写 `monthly/`，
+其余周日写 `weekly/`，其他日期写 `daily/`，不再额外复制到多个前缀。原有三个前缀的生命周期仍适用，
+核验备份时按当日实际前缀查找，不能要求每一天都有 `daily/` 对象。
 数据库、附件备份不包含生产 `.env`、镜像或 DNS/CDN 配置，这些恢复资产需另行受保护保存。
 
 ### 核验与恢复
 
-1. 核对计划存在、worker 在执行窗口运行，以及 `backup.last` 时间、`uploaded=true` 和配对对象清单。
-2. 从 OSS 下载这对对象，与任务记录逐一比较大小和 SHA-256；执行 `pg_restore --list` 和 `tar -tzf` 检查可读性。
+1. 核对计划存在、worker 在执行窗口运行，以及 `backup.last` 时间、`uploaded=true` 和对象清单；无附件时只有数据库对象。
+2. 从 OSS 下载对象，与任务记录逐一比较大小和 SHA-256；执行 `pg_restore --list`，有附件时再用 `tar -tzf` 检查可读性。
 3. 将 dump 恢复到独立临时数据库，在隔离的数据目录恢复附件；核对核心表计数、附件引用和二维码文件，
    再做业务验收。不要直接覆盖生产库。
 4. 新凭证或端点变更后重做上传、下载校验与隔离恢复。`uploaded=true` 或归档可列出均不能替代完整恢复演练。
@@ -188,6 +230,7 @@ DB_BACKUP_STORE_DOMAIN=<bucket>.s3.oss-<region>.aliyuncs.com
   正文分区突出影响范围、恢复方式和处理建议，底部显示北京时间和管理后台按钮；
   聊天列表预览包含状态与标题。过长的周报保留前部内容并提示到后台查看，避免超过机器人 20 KB 限制。
   自定义 Webhook 和应用内部群使用同一份卡片，不需要新增权限或数据库迁移。
+  Webhook 串行发送，上一条收到答复或失败后至少间隔 600 毫秒，避免超出机器人频率限制。
   Webhook 只用于运维通知；不要提交真实地址。
   机器人拒收、HTTP 或网络错误不能记为发送成功。现有告警检查随 worker 每 10 分钟运行，
   当前白天 worker 停止时也不执行检查；这不是全天独立可用性监控。

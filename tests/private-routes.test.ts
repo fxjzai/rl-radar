@@ -1,4 +1,6 @@
 import { createHmac } from "node:crypto";
+import { ADMIN } from "@aihot/site";
+import { SIGN_IN_HOME } from "@aihot/contracts/admin";
 import { config } from "@aihot/backend/config";
 // Malformed optional client data must not break admin authentication or drop valid ingest entries.
 import { tag } from "./setup.ts";
@@ -29,24 +31,42 @@ test("an unrelated malformed cookie leaves a real admin session usable without a
             VALUES (${sha256(token)}, ${user!.id}, 'cookie-test-csrf', now() + interval '1 hour', 'feishu', ${binding}, ${sql.json(claims)})`;
 
   for (const cookie of ["unrelated=%", "aihot_admin=%; unrelated=%E0%A4", "aihot_admin=forged; unrelated=%"]) {
-    const denied = await app.inject({ url: "/api/auth/check", headers: { cookie } });
+    const denied = await app.inject({ url: "/api/admin/me", headers: { cookie } });
     assert.equal(denied.statusCode, 401);
     assert.equal(denied.headers["cache-control"], "no-store");
   }
 
   const headers = { cookie: `unrelated=%; aihot_admin=${token}; another=%E0%A4` };
-  const check = await app.inject({ url: "/api/auth/check", headers });
-  assert.equal(check.statusCode, 204);
   const me = await app.inject({ url: "/api/admin/me", headers });
   assert.equal(me.statusCode, 200);
   assert.equal(me.json().name, "Cookie test");
   assert.equal(me.json().csrf, "cookie-test-csrf");
+  const signedIn = await app.inject({ url: "/api/auth/login?return=%2Fadmin%2Fcontent", headers });
+  assert.equal(signedIn.statusCode, 302);
+  assert.equal(signedIn.headers.location, "/admin/content", "a live session skips the sign-in page");
+  // The skip stays on this site, whatever the return asks for: any path here (a preview page too), else home.
+  for (const [target, location] of [
+    ["javascript:alert(1)", SIGN_IN_HOME], ["data:text/html,x", SIGN_IN_HOME], ["//evil.example/admin", SIGN_IN_HOME],
+    ["/\\evil.example", SIGN_IN_HOME], ["/\t/evil.example", SIGN_IN_HOME], ["https://127.0.0.1:8080/admin/x", "/admin/x"],
+    // Dot segments resolve away and can leave "//" in front: what is returned is what must stay here.
+    ["/x/..//evil.example", SIGN_IN_HOME], ["/%2e%2e//evil.example", SIGN_IN_HOME], ["https://127.0.0.1/x/..//evil.example", SIGN_IN_HOME],
+    ["/all?page=2", "/all?page=2"], [`/${"a".repeat(5000)}`, SIGN_IN_HOME],
+  ]) {
+    const skipped = await app.inject({ url: `/api/auth/login?return=${encodeURIComponent(target!)}`, headers });
+    assert.equal(skipped.headers.location, location, target!.slice(0, 40));
+  }
   const write = await app.inject({ method: "POST", url: "/api/admin/sources", headers, payload: {} });
-  assert.equal(write.statusCode, 403, "the usable session still needs CSRF for writes");
+  if (ADMIN) assert.equal(write.statusCode, 403, "the usable session still needs CSRF for writes");
+  else assert.equal(write.statusCode, 404, "a site without admin pages has no admin API");
 
-  const logout = await app.inject({ method: "POST", url: "/api/auth/logout", headers });
+  // The form parser now in front of sign-out keeps its size limit, and refuses before the session is touched.
+  const oversized = await app.inject({ method: "POST", url: "/api/auth/logout", headers: { ...headers, "content-type": "application/x-www-form-urlencoded" }, payload: `x=${"a".repeat(20_000)}` });
+  assert.equal(oversized.statusCode, 413);
+  assert.equal((await app.inject({ url: "/api/admin/me", headers })).statusCode, 200);
+  // The sign-out button is a plain HTML form: the browser sends this content type even with an empty body.
+  const logout = await app.inject({ method: "POST", url: "/api/auth/logout", headers: { ...headers, "content-type": "application/x-www-form-urlencoded" }, payload: "" });
   assert.equal(logout.statusCode, 303);
-  const ended = await app.inject({ url: "/api/auth/check", headers });
+  const ended = await app.inject({ url: "/api/admin/me", headers });
   assert.equal(ended.statusCode, 401);
 });
 

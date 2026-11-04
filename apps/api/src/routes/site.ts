@@ -5,6 +5,7 @@ import { isCategoryKey, isChannelKey, type CategoryKey, type ChannelKey } from "
 import type { ReportIndexResponse, ReportLatestPage, ReportNavigationResponse, SearchSuggestions, SiteContact } from "@aihot/contracts/site";
 import { InvalidCursorError } from "@aihot/backend/lib/cursor";
 import { exportMarkdown, loadItemDetail } from "@aihot/backend/publication/detail";
+import { itemUrl } from "@aihot/backend/publication/links";
 import { loadPool, SearchBusyError } from "@aihot/backend/publication/pool";
 import { loadTimeline } from "@aihot/backend/publication/timeline";
 import { loadStoryFollowups } from "@aihot/backend/publication/followups";
@@ -18,7 +19,7 @@ import { listTopicSummaries, loadTopicPage, topicBrowseLinks } from "@aihot/back
 import { registerFeedback } from "./feedback.ts";
 import { loadHot, loadStoryDetail, resolveStory } from "@aihot/backend/publication/stories";
 import { listReports, loadReport, reportNavigation, loadReportNavigation, loadReportMonth, type ReportKind } from "@aihot/backend/publication/reports";
-import { looseQuery, sendJsonWithEtag, sendProblem } from "../http/respond.ts";
+import { looseQuery, QueryError, sendJsonWithEtag, sendProblem } from "../http/respond.ts";
 
 type Handler = (req: FastifyRequest, reply: FastifyReply) => Promise<unknown>;
 
@@ -29,7 +30,7 @@ export function siteHandler(fn: Handler): Handler {
     try {
       return await fn(req, reply);
     } catch (error) {
-      if (error instanceof BadRequest) return sendProblem(req, reply, { status: 400, code: "invalid_request", detail: error.message });
+      if (error instanceof BadRequest || error instanceof QueryError) return sendProblem(req, reply, { status: 400, code: "invalid_request", detail: error.message });
       if (error instanceof InvalidCursorError) return sendProblem(req, reply, { status: 400, code: "invalid_cursor", detail: error.message });
       if (error instanceof SearchBusyError) {
         req.log = req.log.child({ reason: "search_capacity_exhausted" });
@@ -219,6 +220,7 @@ export function registerSite(app: FastifyInstance) {
       .header("Content-Disposition", `attachment; filename="${md.filename}"`)
       .header("Cache-Control", "public, max-age=300, s-maxage=300")
       .header("X-Robots-Tag", "noindex")
+      .header("Link", `<${itemUrl(id)}>; rel="canonical"`)
       .send(md.body);
   }));
 }

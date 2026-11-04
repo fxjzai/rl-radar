@@ -3,12 +3,11 @@
 // issue older than the index losing its number; the calendar marking that issue as not published; the
 // daily archive counting 400 issues beside a masthead that numbers 405.
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
 import { after, before, test } from "node:test";
 import type { ReportDetail, ReportKind, ReportNavigationEntry } from "@aihot/contracts/site";
 import { isoWeekLabel } from "@aihot/contracts/time";
-import { issueNumber, periodGrid } from "../app/features/report/format.ts";
-import { startWebServer, type WebServer } from "./web-server.ts";
+import { chipLabel, issueNumber, neighbourLabel, periodGrid } from "../app/features/report/format.ts";
+import { fakeApi, startWebServer, type WebServer } from "./web-server.ts";
 
 const kinds: ReportKind[] = ["daily", "weekly", "monthly"];
 const keys = Object.fromEntries(kinds.map((kind) => [kind, Array.from({ length: 405 }, (_, i) => {
@@ -25,21 +24,17 @@ function report(kind: ReportKind, key: string): ReportDetail {
   };
 }
 let web: WebServer;
-const api = createServer((req, res) => {
-  const path = new URL(req.url!, "http://api.local").pathname;
-  res.setHeader("Content-Type", "application/json");
-  if (path === "/api/site/meta") return res.end(JSON.stringify({ changelogVersion: "2026-09-28T12:00" }));
-  if (path === "/api/site/reports/daily") return res.end(JSON.stringify({ kind: "daily", items: index("daily").map((entry) => ({ ...entry, count: 1 })) }));
+const api = fakeApi((url) => {
+  const path = url.pathname;
+  if (path === "/api/site/reports/daily") return { kind: "daily", items: index("daily").map((entry) => ({ ...entry, count: 1 })) };
   const match = /^\/api\/site\/reports\/(daily|weekly|monthly)\/(.+)$/.exec(path);
   if (match) {
     const kind = match[1] as ReportKind;
     const key = match[2]!;
-    if (key === "latest-page") return res.end(JSON.stringify({ index: index(kind), report: report(kind, keys[kind].at(-1)!) }));
-    if (key.startsWith("navigation/")) return res.end(JSON.stringify({ items: index(kind) }));
-    if (keys[kind].includes(key)) return res.end(JSON.stringify(report(kind, key)));
+    if (key === "latest-page") return { index: index(kind), report: report(kind, keys[kind].at(-1)!) };
+    if (key.startsWith("navigation/")) return { items: index(kind) };
+    if (keys[kind].includes(key)) return report(kind, key);
   }
-  res.statusCode = 404;
-  res.end(JSON.stringify({ code: "not_found" }));
 });
 
 before(async () => { web = await startWebServer(api); });
@@ -87,4 +82,19 @@ test("the daily archive counts every issue, as the masthead numbers them", async
   const response = await fetch(`${web.origin}/daily/archive`);
   assert.equal(response.status, 200, web.logs());
   assert.match(masthead(await response.text()), /共\s*405\s*期/);
+});
+
+// On 2 January 2027 the chip for the 31 December issue read "12月31日" and the 1 January issue's "前一日"
+// link "前一日 · 12月31日": both read as 2027's (KKKKhazix/AIHOT#274).
+test("a day of another Beijing year carries its year in the phone chip and the prev/next links", () => {
+  const days = [{ key: "2026-12-31", issueNumber: 400, title: "第400期" }, { key: "2027-01-01", issueNumber: 401, title: "第401期" }];
+  assert.equal(chipLabel("daily", "2027-01-02", days, "2027-01-02"), "今天");
+  assert.equal(chipLabel("daily", "2027-01-01", days, "2027-01-02"), "1月1日");
+  assert.equal(chipLabel("daily", "2026-12-31", days, "2027-01-02"), "2026年12月31日");
+  const endOfYear = Date.parse("2026-12-31T23:30:00+08:00");
+  assert.equal(neighbourLabel("daily", "2026-12-30", "prev", endOfYear), "前一日 · 12月30日");
+  assert.equal(neighbourLabel("daily", "2027-01-01", "prev", endOfYear), "前一日 · 2027年1月1日");
+  const newYear = Date.parse("2027-01-01T08:00:00+08:00");
+  assert.equal(neighbourLabel("daily", "2026-12-31", "prev", newYear), "前一日 · 2026年12月31日");
+  assert.equal(neighbourLabel("daily", "2027-01-02", "next", newYear), "后一日 · 1月2日");
 });

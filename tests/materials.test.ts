@@ -1,13 +1,16 @@
 // Material storage: every distinct change gets its own revision and history row, also under
 // concurrency; imported history gets a baseline instead of a revision; simultaneous first reports
-// of one URL create one article; other sources' listings, returns to an earlier version and characters
-// lost in transit are no revision (articles used to flip between two versions on every fetch, and a
-// feed garbled a few characters differently on every load).
+// of one URL create one article; other sources' listings, returns to an earlier version, characters
+// lost in transit, characters written as references and a listing's trailing counters are no revision (articles used to flip between
+// two versions on every fetch, a feed garbled a few characters differently on every load, and decoding
+// references would have sent every listed post stored with them back to analysis).
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { closeDb, sql } from "@aihot/backend/db";
 import { upsertMaterial } from "@aihot/backend/content/materials";
+import { readPublicationDate } from "@aihot/backend/sources/dates";
+import { loadAnalyzeInput, buildMaterial } from "@aihot/backend/editorial/input";
 import { identityKeyForUrl } from "@aihot/backend/lib/url";
 
 const SOURCE = `test-materials-${tag()}`;
@@ -115,6 +118,28 @@ test("another source listing the same article records a discovery, not a revisio
   assert.ok(found.some((d) => d.source_id === OTHER), "the other source still counts as a discovery");
 });
 
+test("a listing's trailing live counters are no revision, its prose numbers are", async () => {
+  // A trending listing ends every entry's description with counters that move on every load.
+  const listed = { sourceId: SOURCE, url: `https://example.com/trending-${tag()}`, title: "A trending repo", via: "fetch" as const };
+  const counted = (stars: string, forks: string) => `An engine that raised 2 million. Language: TypeScript Stars: ${stars} Forks: ${forks}`;
+  const { articleId } = await upsertMaterial({ ...listed, excerpt: counted("12976", "2545") });
+  for (const [stars, forks] of [["12980", "2546"], ["13,001", "2,550"]]) {
+    assert.equal((await upsertMaterial({ ...listed, excerpt: counted(stars!, forks!) })).revised, false);
+  }
+  assert.equal((await state(articleId)).revision, 1);
+  assert.equal((await upsertMaterial({ ...listed, excerpt: counted("13002", "2551").replace("TypeScript", "Rust") })).revised, true, "a changed label's text is a change");
+  assert.equal((await upsertMaterial({ ...listed, excerpt: counted("13003", "2552").replace("Language: TypeScript", "Language: Rust").replace("2 million", "20 million") })).revised, true, "a number in the prose is a correction");
+  const scored = { ...listed, url: `https://example.com/benchmark-${tag()}` };
+  await upsertMaterial({ ...scored, excerpt: "Model benchmark. Accuracy: 90.5" });
+  assert.equal((await upsertMaterial({ ...scored, excerpt: "Model benchmark. Accuracy: 95.2" })).revised, true, "a lone labelled figure is a correction");
+  const labelled = { ...listed, url: `https://example.com/metrics-${tag()}` };
+  await upsertMaterial({ ...labelled, excerpt: "Benchmark. Accuracy: 90 Recall: 80" });
+  assert.equal((await upsertMaterial({ ...labelled, excerpt: "Benchmark. Precision: 90 Recall: 80" })).revised, true, "a changed label is a change");
+  const encoded = { ...listed, url: `https://example.com/encoded-${tag()}` };
+  await upsertMaterial({ ...encoded, excerpt: "A repo. Stars: 100 Forks&#58; 20" });
+  assert.equal((await upsertMaterial({ ...encoded, excerpt: "A repo. Stars: 100 Forks: 20" })).revised, false, "a label written as a reference is still that label");
+});
+
 test("an article linking to a tweet is stored separately from the tweet", async () => {
   const tweetId = `${Date.now()}123456`;
   const url = `https://x.com/openai/status/${tweetId}`;
@@ -191,4 +216,44 @@ test("characters lost in transit are no revision, lost or restored", async () =>
   assert.equal((await upsertMaterial(edited(garbled[1]!))).revised, true, "a real change is one, lost characters or not");
   for (const report of [edited(clean), edited(garbled[2]!)]) assert.equal((await upsertMaterial(report)).revised, false);
   assert.equal((await state(first.articleId)).revision, 2);
+});
+
+test("a character written as a reference is the same text, stored either way", async () => {
+  // Titles and summaries stored before feeds' references were decoded keep them; the same listing
+  // read again arrives decoded and is no new material (no second analysis of every listed post).
+  const url = `https://example.com/references-${tag()}`;
+  const stored = { sourceId: SOURCE, url, title: "Friends don&#8217;t let friends &mdash; ever", excerpt: "what you&#x2019;ll get &amp; more&hellip;", via: "fetch" as const };
+  const first = await upsertMaterial(stored);
+  const decoded = { ...stored, title: "Friends don’t let friends — ever", excerpt: "what you’ll get & more…" };
+  assert.equal((await upsertMaterial(decoded)).revised, false);
+  assert.equal((await upsertMaterial(stored)).revised, false);
+  assert.equal((await state(first.articleId)).revision, 1);
+  assert.equal((await upsertMaterial({ ...decoded, title: "Friends don’t let friends, updated" })).revised, true, "a real change still is one");
+});
+
+test('stored publication date remains a date in the model input, even at a source timezone boundary', async () => {
+  const source = 'precision-fixture';
+  await sql`INSERT INTO sources (id,name,kind,config,tier) VALUES (${source},'Precision','external','{}','T1')`;
+  const input = { sourceId: source, url: 'https://example.org/date', title: 'Original day', bodyText: 'Original text', bodyStatus: 'ok' as const, via: 'fetch' as const,
+    ...readPublicationDate('2026-10-13', '-07:00'), discoveredAt: new Date('2026-10-13T09:00:00Z') };
+  const { articleId } = await upsertMaterial(input);
+  const article = await loadAnalyzeInput(articleId);
+  assert.equal(article?.publicationTime, '2026-10-13');
+  assert.match(buildMaterial(article!), /2026-10-13（原文仅有日期，时刻未知）/);
+  assert.doesNotMatch(buildMaterial(article!), /15:00/);
+  await upsertMaterial(input);
+  const [row] = await sql`SELECT publication_time, revision FROM articles WHERE id=${articleId}`;
+  assert.equal(row?.publication_time, '2026-10-13');
+  assert.equal(row?.revision, 1);
+});
+
+test("rereading an exact midnight upgrades day precision without a new revision", async () => {
+  const input = { sourceId: SOURCE, url: `https://example.com/precision-${tag()}`, title: "Release", via: "fetch" as const,
+    ...readPublicationDate("2026-10-13", "-07:00"), discoveredAt: new Date("2026-10-13T09:00:00Z") };
+  const { articleId } = await upsertMaterial(input);
+  await upsertMaterial({ ...input, ...readPublicationDate("2026-10-13T00:00:00-07:00") });
+  await upsertMaterial(input);
+  const [row] = await sql`SELECT publication_time, revision FROM articles WHERE id=${articleId}`;
+  assert.equal(row!.publication_time, "2026-10-13T07:00:00.000Z");
+  assert.equal(row!.revision, 1);
 });
